@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phases 0-6 are done**, plus the History view and autostart. What exists and
-passes (248 tests green, clippy clean):
+**Phases 0-6 and 8 are done**, plus the History view and autostart. What exists
+and passes (252 tests green, clippy clean under `-D warnings`):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -62,8 +62,15 @@ passes (248 tests green, clippy clean):
   leave a stale `match` arm behind that silently refuses to write.
   **Unverified on the wire** — see below.
 
-**Not built yet:** packaging (Phase 8). History has no retry/restore actions
-yet — it is read-only plus export.
+- **Packaging:** `createUpdaterArtifacts` and `requireSignedVersion` settled (see
+  Release signing), a Rust-side update check in `update.rs` surfaced in Settings,
+  and `.github/workflows/{ci,release}.yml` — CI gates on svelte-check, `clippy -D
+  warnings`, `cargo test` and a single-TLS-stack check; the release workflow gates
+  on the same, matches the tag against `tauri.conf.json`, drafts, attaches
+  `SHA256SUMS.txt`, then publishes.
+
+**Not built yet:** History has no retry/restore actions yet — it is read-only plus
+export. No release has been cut, so neither workflow has ever run.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an
@@ -97,7 +104,7 @@ never `cargo tauri`.
 ```bash
 npm install
 npm run tauri dev                # run the app (Vite + Rust core)
-npm run tauri build              # MSI + NSIS bundles
+npm run tauri build              # MSI + NSIS bundles (+ updater artifacts, with the signing env vars)
 npm run tauri info               # verify the Tauri/WebView2 toolchain
 npm run check                    # svelte-check
 npm run dev                      # Vite alone (commands unavailable; views inert)
@@ -108,8 +115,8 @@ cargo test parse::                           # one module
 cargo test --test corpus                     # corpus invariants over the fixtures
 cargo test published_vector_buy -- --exact   # a single test
 cargo test --test corpus -- --ignored --nocapture   # live scan of the real Game.log
-cargo clippy --all-targets
-cargo tree -d                                # duplicate deps / TLS stacks
+cargo clippy --all-targets -- -D warnings    # what CI enforces
+cargo tree -d                                # informational only: it exits 0 whatever it finds
 ```
 
 Tests touching a real install are `#[ignore]`d; CI runs against the redacted fixtures
@@ -338,14 +345,47 @@ TAURI_SIGNING_PRIVATE_KEY_PASSWORD=<the password>
 
 Without them `npm run tauri build` produces no updater artifacts.
 
+**But the secrets alone are not enough, and this was nearly shipped wrong.**
+`bundle.createUpdaterArtifacts` defaults to **`false`**, and a build without it
+looks entirely successful: the MSI and NSIS installers are produced, the signing
+secrets are accepted without complaint, and `tauri-action` writes a `latest.json`
+pointing at `.sig` files that were never created. Every copy installed from such a
+release is permanently stranded. It is now `true` in `tauri.conf.json` and
+`update::tests::updater_artifacts_are_produced` asserts it stays that way.
+
+Verified by building: with it on and no key set, `npm run tauri build` writes both
+installers and then **exits 1** with "A public key has been found, but no private
+key". That non-zero exit on a plain local build is the point — don't "fix" it by
+turning the flag back off. Measured output at 0.1.0: MSI 3.65 MiB, NSIS 2.70 MiB
+(PLAN.md §13 guessed 8–15 MB).
+
 **If the password is lost after a release ships, every installed copy becomes
 permanently un-updatable** — the updater verifies against the baked-in public key and
 there is no recovery path short of asking users to reinstall by hand. Rotating the key
 means a new `pubkey`, which only helps versions released *after* the swap.
 
-`tauri signer sign` also takes `--app-version`, which binds a signature to a version;
-an updater configured with `requireSignedVersion` rejects signatures made without it.
-Worth settling in Phase 8 rather than at the first release.
+**`requireSignedVersion` is on, and that question is settled.** Checked against the
+pinned CLI and `tauri-plugin-updater` 2.14.1 rather than from memory:
+
+- The endpoint response (`latest.json`) is fetched over TLS but is **not itself
+  signed** — the signature only covers the downloaded artifact. So anyone able to
+  serve a crafted response can pair an inflated `version` with the `url` and
+  `signature` of an *older* release and force a downgrade to a genuine, validly
+  signed, outdated build. For this app that means downgrading to a version whose
+  write-path bugs are known.
+- The flag's default is `false`, and `--app-version` is what records the version in
+  the signature's trusted comment. **`tauri build` passes it automatically**, so
+  there is no extra step — it only has to be passed by hand when signing updater
+  artifacts manually.
+- Turning it on later is *not* equivalent, which is why it had to be decided now:
+  signatures made before the CLI recorded a version carry none, so enabling the flag
+  rejects them — every release users can still update from has to be re-signed and
+  re-published first. And until it is on, an attacker can bypass the check outright
+  by serving one of those older signatures.
+
+Since no release exists yet, enabling it at 0.1.0 is free. `update.rs` has tests
+pinning the flag, the pubkey's single-encoding, and that `tauri.conf.json` and
+`Cargo.toml` agree about the version.
 
 ## UI conventions
 

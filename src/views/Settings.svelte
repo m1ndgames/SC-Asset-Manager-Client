@@ -9,9 +9,16 @@
     testBackend,
     detectLogPath,
     isAppError,
+    checkForUpdate,
+    installUpdate,
     type ConfigDto,
     type HealthReport,
+    type UpdateInfo,
+    type UpdateProgress,
   } from "../lib/ipc";
+  import { listen } from "@tauri-apps/api/event";
+  import { getVersion } from "@tauri-apps/api/app";
+  import { onMount } from "svelte";
 
   let cfg = $state<ConfigDto | null>(null);
   let cfgPath = $state("");
@@ -27,6 +34,51 @@
     null,
   );
   let health = $state<HealthReport | null>(null);
+
+  // Updates. Nothing is checked automatically -- the user asks.
+  let update = $state<UpdateInfo | null>(null);
+  let checking = $state(false);
+  let installing = $state(false);
+  let progress = $state<UpdateProgress | null>(null);
+  let updateError = $state("");
+  // Read locally from the bundle, so the version shows without a network check.
+  let version = $state("");
+
+  onMount(() => {
+    void getVersion().then((v) => (version = v));
+    const stop = listen<UpdateProgress>("update://progress", (e) => {
+      progress = e.payload;
+    });
+    return () => {
+      void stop.then((f) => f());
+    };
+  });
+
+  async function check() {
+    checking = true;
+    updateError = "";
+    update = null;
+    try {
+      update = await checkForUpdate();
+    } catch (e) {
+      updateError = isAppError(e) ? e.message : String(e);
+    } finally {
+      checking = false;
+    }
+  }
+
+  async function install() {
+    installing = true;
+    updateError = "";
+    try {
+      // On success the app relaunches, so this does not return.
+      await installUpdate();
+    } catch (e) {
+      updateError = isAppError(e) ? e.message : String(e);
+      installing = false;
+      progress = null;
+    }
+  }
 
   async function load() {
     cfg = await getConfig();
@@ -367,6 +419,69 @@
           </span>
         </span>
       </label>
+    </Panel>
+
+    <Panel title="Updates">
+      {#snippet actions()}
+        <button
+          class="border border-border px-3 py-1 font-display text-xs tracking-widest text-text uppercase disabled:opacity-40"
+          onclick={check}
+          disabled={checking || installing}
+        >
+          {checking ? "Checking…" : "Check for updates"}
+        </button>
+      {/snippet}
+
+      <p class="text-sm text-muted">
+        Version <span class="font-mono text-text">{version}</span>.
+        Nothing is checked automatically, and the check runs in the app's Rust core
+        — this window never talks to the network.
+      </p>
+
+      {#if updateError}
+        <p class="mt-3 text-sm text-danger-text">{updateError}</p>
+      {:else if update?.available}
+        <div class="mt-3 border border-accent/40 bg-accent/5 p-3">
+          <p class="text-sm text-text">
+            Version <span class="font-mono text-accent">{update.version}</span> is
+            available.
+            {#if update.date}
+              <span class="text-muted">Published {update.date.slice(0, 10)}.</span>
+            {/if}
+          </p>
+          {#if update.notes}
+            <pre class="mt-2 max-h-40 overflow-auto font-body text-xs whitespace-pre-wrap text-muted">{update.notes}</pre>
+          {/if}
+
+          {#if installing}
+            <p class="mt-3 font-mono text-xs text-muted">
+              {#if progress?.done}
+                Installing… the app will restart.
+              {:else if progress?.total}
+                Downloading {Math.round((progress.downloaded / progress.total) * 100)}%
+              {:else if progress}
+                Downloading {Math.round(progress.downloaded / 1024)} KiB
+              {:else}
+                Starting…
+              {/if}
+            </p>
+          {:else}
+            <button
+              class="mt-3 bg-accent px-4 py-1.5 font-display text-xs tracking-widest text-bg uppercase"
+              onclick={install}
+            >
+              Install and restart
+            </button>
+            <p class="mt-2 text-xs text-muted">
+              The app closes and reopens. Anything already written stays written, and
+              the review queue is saved to disk after every change — but finish any
+              trade you are part-way through reviewing first.
+            </p>
+          {/if}
+        </div>
+      {:else if update}
+        <p class="mt-3 text-sm text-accent">This is the newest version.</p>
+      {/if}
     </Panel>
 
     <div class="flex items-center gap-3">

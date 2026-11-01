@@ -34,6 +34,11 @@ pub enum AppError {
     /// of just saying no.
     #[error("not ready to write: {}", describe_blockers(blockers))]
     NotReady { blockers: Vec<crate::queue::Blocker> },
+
+    /// An update could not be checked for or installed. Never fatal — the app
+    /// is perfectly usable without updating.
+    #[error("{0}")]
+    Update(String),
 }
 
 impl AppError {
@@ -46,6 +51,7 @@ impl AppError {
             AppError::Refdata(_) => "refdata",
             AppError::Queue(_) => "queue",
             AppError::NotReady { .. } => "notReady",
+            AppError::Update(_) => "update",
         }
     }
 }

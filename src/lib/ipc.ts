@@ -415,3 +415,32 @@ export const exportHistoryCsv = (path: string): Promise<number> =>
 export const getRefdata = (): Promise<RefData> => invoke("get_refdata");
 
 export const refreshRefdata = (): Promise<RefData> => invoke("refresh_refdata");
+
+// ---------------------------------------------------------------------------
+// Updates
+// ---------------------------------------------------------------------------
+
+export interface UpdateInfo {
+  available: boolean;
+  currentVersion: string;
+  version: string | null;
+  notes: string | null;
+  date: string | null;
+}
+
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+  done: boolean;
+}
+
+/**
+ * Both of these run in Rust rather than through
+ * `@tauri-apps/plugin-updater`, because the webview makes no outbound
+ * requests — that is what keeps the CSP at `default-src 'self'`.
+ */
+export const checkForUpdate = (): Promise<UpdateInfo> =>
+  invoke("check_for_update");
+
+/** Installs and relaunches, so this never resolves on success. */
+export const installUpdate = (): Promise<void> => invoke("install_update");

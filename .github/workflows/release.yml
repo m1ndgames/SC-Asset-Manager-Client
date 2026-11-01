@@ -1,0 +1,134 @@
+# Builds and publishes a Windows release on a `v*` tag.
+#
+# Two secrets are required, and without them the build silently produces no
+# updater artifacts at all — the installers come out fine, `latest.json` does
+# not, and every installed copy quietly stops seeing updates:
+#
+#   TAURI_SIGNING_PRIVATE_KEY           the contents of sc-asset-manager-client.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the password that key was generated with
+#
+# If that password is ever lost, every copy already installed becomes
+# permanently un-updatable: the updater verifies against the public key baked
+# into the binary, and rotating the key only helps releases published after the
+# swap. There is no recovery path short of asking people to reinstall by hand.
+#
+# The release is created as a draft, the checksums are attached, and only then
+# is it published — so nobody can download an installer before the hashes that
+# verify it exist.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allows a dry run against a branch: everything builds, nothing is published.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Keyed on Cargo.lock, which is committed, so a release build does not
+      # recompile the whole dependency graph every time.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # The gates. A release must not be cut from a tree that does not pass
+      # what every other commit has to pass.
+      - run: npm run check
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
+      - run: cargo test
+        working-directory: src-tauri
+
+      # The version in the tag and the version that gets baked into the
+      # binary must agree. They are set in two files by hand, and a mismatch
+      # produces a release that either never offers itself as an update or
+      # offers itself forever.
+      - name: Check the tag matches the configured version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($tag -ne $conf) {
+            throw "tag $tag does not match tauri.conf.json version $conf"
+          }
+          Write-Host "version $conf"
+
+      - name: Build and draft the release
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: SC Asset Manager Client ${{ github.ref_name }}
+          releaseBody: |
+            Windows installers are below. **They are not code-signed**, so
+            SmartScreen will warn on first run — see the README for what that
+            looks like and how to verify the download against
+            `SHA256SUMS.txt`.
+
+            WebView2 is required and ships with Windows 11 and current
+            Windows 10; the installer fetches it if it is missing.
+          releaseDraft: true
+          prerelease: false
+          # Writes latest.json, which is what tauri-plugin-updater reads.
+          includeUpdaterJson: true
+
+      # Published unsigned, so the hashes are the only way for someone to
+      # check that what they downloaded is what was built.
+      - name: Attach SHA-256 checksums
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $raw = '${{ steps.tauri.outputs.artifactPaths }}'
+          $paths = @()
+          if ($raw) { try { $paths = $raw | ConvertFrom-Json } catch { } }
+          # Fall back to the bundle layout if that output ever changes shape.
+          # Publishing without checksums would be worse than a noisy build.
+          if (-not $paths) {
+            Write-Host "artifactPaths was empty; globbing the bundle directory"
+            $paths = Get-ChildItem -Recurse -File src-tauri/target/release/bundle `
+              -Include *.msi, *-setup.exe, *.zip, *.sig | ForEach-Object { $_.FullName }
+          }
+          $lines = foreach ($p in $paths) {
+            if (Test-Path $p) {
+              $h = (Get-FileHash -Algorithm SHA256 -Path $p).Hash.ToLower()
+              "$h  $([System.IO.Path]::GetFileName($p))"
+            }
+          }
+          if (-not $lines) { throw "no artifacts to checksum" }
+          $lines | Set-Content -Path SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+          gh release upload ${{ github.ref_name }} SHA256SUMS.txt --clobber
+
+      # Last, so the release never appears without its checksums.
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit ${{ github.ref_name }} --draft=false

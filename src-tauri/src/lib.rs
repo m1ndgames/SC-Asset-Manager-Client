@@ -20,6 +20,7 @@ pub mod queue;
 pub mod refdata;
 pub mod state;
 pub mod units;
+pub mod update;
 pub mod writer;
 pub mod watcher_task;
 pub mod watchstate;
@@ -93,6 +94,8 @@ pub fn run() {
             commands::export_history_csv,
             commands::get_refdata,
             commands::refresh_refdata,
+            update::check_for_update,
+            update::install_update,
             probe::phase1_probe,
             probe::delete_test_asset,
         ])

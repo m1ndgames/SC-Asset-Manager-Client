@@ -1,0 +1,69 @@
+# The same three gates the release workflow runs, on every push.
+#
+# Every test that touches a real Star Citizen install or a real backend is
+# `#[ignore]`d, so this runs entirely against the redacted fixtures committed
+# in `src-tauri/tests/fixtures/` and needs no secrets.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: svelte-check
+        run: npm run check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: tests
+        run: cargo test
+        working-directory: src-tauri
+
+      # One TLS stack, not two. A plugin pinning an older reqwest would pull in
+      # a second one, inflating the bundle and giving Windows two different
+      # certificate paths to behave differently on.
+      #
+      # `cargo tree -d` is not the check: it exits 0 whatever it finds, and
+      # this tree legitimately carries two `base64` majors transitively. So
+      # this asserts on the crates that actually matter.
+      - name: one TLS stack
+        shell: pwsh
+        working-directory: src-tauri
+        run: |
+          $pat = '(?<![\w-])(reqwest|rustls|native-tls|openssl|openssl-sys) v\d+\.\d+\.\d+'
+          $found = (cargo tree) -join "`n" |
+            Select-String -Pattern $pat -AllMatches |
+            ForEach-Object { $_.Matches.Value } |
+            Sort-Object -Unique
+          $found | ForEach-Object { Write-Host $_ }
+          $bad = $found | Where-Object { $_ -match '^(native-tls|openssl)' }
+          if ($bad) { throw "a non-rustls TLS stack crept in: $bad" }
+          foreach ($crate in 'reqwest', 'rustls') {
+            $n = @($found | Where-Object { $_ -match "^$crate " }).Count
+            if ($n -ne 1) { throw "expected exactly one $crate, found $n" }
+          }
