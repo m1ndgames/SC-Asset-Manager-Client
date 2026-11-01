@@ -166,3 +166,62 @@ export const parseFirebaseConfig = (text: string): Promise<FirebaseConfig> =>
   invoke("parse_firebase_config", { text });
 
 export const testBackend = (): Promise<HealthReport> => invoke("test_backend");
+
+// ---------------------------------------------------------------------------
+// The watcher
+// ---------------------------------------------------------------------------
+
+/** What starting the watcher would do. Mirrors Rust's `ColdStart`. */
+export type ColdStart =
+  | { kind: "resume"; offset: number }
+  | { kind: "backfill"; reason: "replaced" | "truncated" | "differentPath" }
+  | { kind: "firstRun"; trades: number; endOffset: number }
+  | { kind: "noLog" };
+
+export interface WatchStatus {
+  path: string;
+  running: boolean;
+  logPresent: boolean;
+  /** Where reading has got to. */
+  readOffset: number;
+  /**
+   * Where resolution has got to — the offset that is actually persisted. It
+   * sits behind `readOffset` exactly while a detection is inside its grace
+   * window, which is the property that stops a crash losing a trade.
+   */
+  safeOffset: number;
+  pending: number;
+  graceWindowMs: number;
+  linesSeen: number;
+  classMatched: number;
+  promoted: number;
+  discarded: number;
+  malformed: number;
+  rotations: number;
+  lastLogTimestamp: string | null;
+}
+
+/** Event names emitted by the watcher thread. */
+export const EV = {
+  status: "watcher://status",
+  rotated: "watcher://log-rotated",
+  detected: "tx://detected",
+  discarded: "tx://discarded",
+  malformed: "tx://malformed",
+} as const;
+
+export const planWatchStart = (): Promise<ColdStart> =>
+  invoke("plan_watch_start");
+
+/**
+ * Start watching. `offset` is the user's answer to a `firstRun` plan; omit it
+ * to take the plan's own default, which is start-from-now — never a silent
+ * import of a session nobody asked to import.
+ */
+export const startWatcher = (offset?: number): Promise<WatchStatus> =>
+  invoke("start_watcher", { offset });
+
+export const stopWatcher = (): Promise<void> => invoke("stop_watcher");
+
+export const watcherStatus = (): Promise<WatchStatus | null> =>
+  invoke("watcher_status");

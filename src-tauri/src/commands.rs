@@ -9,8 +9,10 @@ use crate::backend::firebase::FirebaseBackend;
 use crate::backend::{BackendError, HealthReport, SyncBackend};
 use crate::config::{self, BackendKind, ConfigDto, ConfigPatch, FirebaseConfig};
 use crate::error::{AppError, AppResult};
+use crate::log::watcher::{self, ColdStart, WatchStatus};
 use crate::log::{discover, scan};
 use crate::state::AppState;
+use crate::{watcher_task, watchstate};
 
 /// Where the client thinks your Game.log is.
 #[derive(serde::Serialize)]
@@ -134,6 +136,102 @@ pub async fn test_backend(state: State<'_, AppState>) -> Result<HealthReport, Ba
             "PocketBase support is not built yet — it lands in Phase 6".into(),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The watcher
+// ---------------------------------------------------------------------------
+
+/// Resolve the log path the way every watcher command resolves it: the
+/// override if set, else detection.
+fn watch_path(cfg: &config::Config) -> AppResult<PathBuf> {
+    if !cfg.log_path.trim().is_empty() {
+        return Ok(PathBuf::from(&cfg.log_path));
+    }
+    discover::detect().ok_or(AppError::LogNotFound)
+}
+
+/// What starting the watcher would do, without doing it.
+///
+/// The UI asks this first and, on `firstRun`, puts the choice to the user:
+/// importing a session nobody asked to import is the one cold-start mistake
+/// that cannot be undone quietly.
+#[tauri::command]
+pub fn plan_watch_start(state: State<'_, AppState>) -> AppResult<ColdStart> {
+    let cfg = state.config();
+    let path = watch_path(&cfg)?;
+    Ok(cold_start_for(&path))
+}
+
+/// Start watching.
+///
+/// `offset` is the decision `plan_watch_start` offered: the stored mark for a
+/// resume, the file length for start-from-now, or 0 to read the whole file.
+/// The UI passes back what the user chose; omitting it takes the plan's own
+/// answer, with start-from-now as the first-run default.
+#[tauri::command]
+pub fn start_watcher(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    offset: Option<u64>,
+) -> AppResult<WatchStatus> {
+    let cfg = state.config();
+    let path = watch_path(&cfg)?;
+
+    let mut guard = state.watcher.lock().unwrap();
+    if let Some(h) = guard.as_ref() {
+        // Already running on that path: report rather than start a second one.
+        if h.path == path {
+            return Ok(h.status());
+        }
+        // The path changed under us. Stop the old one first.
+        if let Some(old) = guard.take() {
+            old.stop();
+        }
+    }
+
+    let offset = match offset {
+        Some(o) => o,
+        None => match cold_start_for(&path) {
+            ColdStart::Resume { offset } => offset,
+            // Default to start-from-now, never a silent import.
+            ColdStart::FirstRun { end_offset, .. } => end_offset,
+            ColdStart::Backfill { .. } => watchstate::load().offset,
+            ColdStart::NoLog => 0,
+        },
+    };
+
+    let handle = watcher_task::start(app, &cfg, path, offset)?;
+    let status = handle.status();
+    *guard = Some(handle);
+    Ok(status)
+}
+
+/// The cold-start decision, with the trade count filled in only when a first
+/// run makes one necessary.
+fn cold_start_for(path: &std::path::Path) -> ColdStart {
+    let st = watchstate::load();
+    watcher::plan_cold_start(path, &st, |p| match std::fs::read(p) {
+        Ok(bytes) => scan::scan(&String::from_utf8_lossy(&bytes), 0).trades.len(),
+        Err(_) => 0,
+    })
+}
+
+/// Stop watching. Anything still inside its grace window is promoted on the
+/// way out rather than dropped.
+#[tauri::command]
+pub fn stop_watcher(state: State<'_, AppState>) -> AppResult<()> {
+    let handle = state.watcher.lock().unwrap().take();
+    if let Some(h) = handle {
+        h.stop();
+    }
+    Ok(())
+}
+
+/// Current watcher status, or `None` when not watching.
+#[tauri::command]
+pub fn watcher_status(state: State<'_, AppState>) -> Option<WatchStatus> {
+    state.watcher.lock().unwrap().as_ref().map(|h| h.status())
 }
 
 #[cfg(test)]

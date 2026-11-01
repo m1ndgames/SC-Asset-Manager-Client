@@ -264,7 +264,9 @@ pub fn save(cfg: &Config) -> AppResult<()> {
     write_atomic(&tmp, &path, text.as_bytes())
 }
 
-fn write_atomic(tmp: &Path, target: &Path, bytes: &[u8]) -> AppResult<()> {
+/// Atomic write, shared with `watchstate`: temp file in the same directory,
+/// fsynced, then renamed over the target.
+pub fn write_atomic(tmp: &Path, target: &Path, bytes: &[u8]) -> AppResult<()> {
     use std::io::Write;
     {
         let mut f = std::fs::File::create(tmp)

@@ -17,6 +17,8 @@ pub mod model;
 pub mod probe;
 pub mod state;
 pub mod units;
+pub mod watcher_task;
+pub mod watchstate;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -55,6 +57,10 @@ pub fn run() {
             commands::config_file_path,
             commands::parse_firebase_config,
             commands::test_backend,
+            commands::plan_watch_start,
+            commands::start_watcher,
+            commands::stop_watcher,
+            commands::watcher_status,
             probe::phase1_probe,
             probe::delete_test_asset,
         ])

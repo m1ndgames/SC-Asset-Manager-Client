@@ -4,20 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phases 0 and 1 are partly done.** What exists and passes:
+**Phases 0, 1 and 2 are done.** What exists and passes (149 tests green, clippy clean):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated and `pubkey` wired in.
-- `ids.rs`, `units.rs`, `log/parse.rs`, `log/scan.rs`, `log/discover.rs` with 62 tests
-  green, including both published UUIDv5 vectors and a corpus suite over 11 real
-  sessions.
-- `rescan_log` / `detect_log_path` commands, surfaced in the Diagnostics tab.
+- The pure core: `ids.rs`, `units.rs`, `log/parse.rs`, `log/scan.rs`, `log/discover.rs`,
+  including both published UUIDv5 vectors and a corpus suite over 11 real sessions.
+- `config.rs` (password never crosses into the webview), `backend/firebase.rs` +
+  `backend/value.rs`, `probe.rs`, and a working Settings view. Firestore PATCH
+  semantics settled against a real project — see below.
+- **The watcher:** `log/tail.rs` (polling, share flags, rotation, the offset
+  invariant), `log/correlate.rs` (the live grace window, clock-injected),
+  `watchstate.rs` (`state.json`: offset + file identity + bounded id filter +
+  log-clock watermark), `log/watcher.rs` (the pipeline, cold start, backfill
+  filter) and `watcher_task.rs` (the thread and the events). Surfaced in
+  Diagnostics with a live feed.
 
-**Not built yet:** the backend layer (`backend/`, `writer.rs`), the queue state machine,
-`refdata.rs`, `config.rs`, the tailer (`log/tail.rs`, `log/correlate.rs`), and the
-Review/Settings/History views, which are placeholders. Next up is Phase 1's remaining
-half: `backend/firebase.rs` far enough for `sign_in`, `health_check` and one
-`upsert_asset`, then editing and deleting that record in the web app.
+**Not built yet:** `queue.rs` and the queue state machine, `writer.rs`, `refdata.rs`,
+and the Review/History views, which are still placeholders. Next up is Phase 3: the
+review queue and the buy write path.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an
@@ -103,6 +108,18 @@ filesystem (`backend/mock.rs` stands in for the backend).
 - **Persistence ordering.** Per batch: enqueue → fsync `queue.json` → *then* advance
   and fsync the offset. The reverse order loses trades; this order at worst re-reads
   lines, and the deterministic id collapses the duplicate.
+- **Two offsets, and only one is persisted.** `Tailer::offset()` is where *reading*
+  got to; `Watcher`'s `safe_offset` is where *resolution* got to, and it is the only
+  one written to `state.json`. It is held back for as long as anything sits in the
+  grace window, because a held detection lives in `Correlator`'s memory and nowhere
+  else. `log/watcher_tests.rs` asserts both directions: a crash mid-window re-reads
+  the line, and a resolved line is never read twice.
+- **A discard resolves its line too.** `mark_processed` is called on promotion *and*
+  on discard, or a backfill resurrects a trade the game already told us failed.
+- **Rotation clears the position, never the id filter.** `processed_ids` must survive
+  a relaunch, or every trade of the previous session comes back.
+- **Nothing is read until the user says so.** A first run reports the trade count it
+  found and offers start-from-now (the default) or import; it never imports silently.
 - **`quantityRaw` is never parsed.** The UUIDv5 name string takes every field verbatim
   from the log — `100800.000000` must stay exactly that string. There is a test
   asserting it never round-trips through `f64`; don't relax it.

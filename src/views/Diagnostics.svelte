@@ -1,17 +1,97 @@
 <script lang="ts">
+  import { listen } from "@tauri-apps/api/event";
   import Panel from "../components/Panel.svelte";
   import {
     detectLogPath,
     rescanLog,
     isAppError,
+    planWatchStart,
+    startWatcher,
+    stopWatcher,
+    watcherStatus,
+    EV,
     type ScanReport,
     type LogLocation,
+    type ColdStart,
+    type WatchStatus,
+    type DetectedTrade,
+    type DiscardedTrade,
   } from "../lib/ipc";
 
   let location = $state<LogLocation | null>(null);
   let report = $state<ScanReport | null>(null);
   let busy = $state(false);
   let error = $state<string | null>(null);
+
+  // --- the watcher -------------------------------------------------------
+  let status = $state<WatchStatus | null>(null);
+  let plan = $state<ColdStart | null>(null);
+  let starting = $state(false);
+  /** Newest first. Nothing is written anywhere yet — Phase 3 adds the queue. */
+  let feed = $state<
+    Array<
+      | { k: "detected"; at: string; t: DetectedTrade }
+      | { k: "discarded"; at: string; d: DiscardedTrade }
+      | { k: "malformed"; at: string; raw: string }
+      | { k: "rotated"; at: string }
+    >
+  >([]);
+
+  const clock = () => new Date().toLocaleTimeString("en-GB");
+
+  function push(item: (typeof feed)[number]) {
+    feed = [item, ...feed].slice(0, 50);
+  }
+
+  async function refreshPlan() {
+    try {
+      plan = await planWatchStart();
+    } catch (e) {
+      plan = null;
+      error = isAppError(e) ? e.message : String(e);
+    }
+  }
+
+  async function start(offset?: number) {
+    starting = true;
+    error = null;
+    try {
+      status = await startWatcher(offset);
+    } catch (e) {
+      error = isAppError(e) ? e.message : String(e);
+    } finally {
+      starting = false;
+    }
+  }
+
+  async function stop() {
+    try {
+      await stopWatcher();
+      status = null;
+      await refreshPlan();
+    } catch (e) {
+      error = isAppError(e) ? e.message : String(e);
+    }
+  }
+
+  $effect(() => {
+    const subs = [
+      listen<WatchStatus>(EV.status, (e) => (status = e.payload)),
+      listen<WatchStatus>(EV.rotated, () =>
+        push({ k: "rotated", at: clock() }),
+      ),
+      listen<DetectedTrade>(EV.detected, (e) =>
+        push({ k: "detected", at: clock(), t: e.payload }),
+      ),
+      listen<DiscardedTrade>(EV.discarded, (e) =>
+        push({ k: "discarded", at: clock(), d: e.payload }),
+      ),
+      listen<{ raw?: string }>(EV.malformed, (e) =>
+        push({ k: "malformed", at: clock(), raw: e.payload?.raw ?? "—" }),
+      ),
+    ];
+    return () => subs.forEach((p) => p.then((un) => un()));
+  });
 
   async function detect() {
     error = null;
@@ -43,10 +123,182 @@
       maximumFractionDigits: 6,
     });
 
-  detect();
+  (async () => {
+    await detect();
+    status = await watcherStatus();
+    if (!status) await refreshPlan();
+  })();
 </script>
 
 <div class="flex flex-col gap-4">
+  <Panel title="Watcher">
+    {#snippet actions()}
+      {#if status?.running}
+        <button
+          class="border border-accent px-3 py-1 font-display text-xs tracking-widest text-accent uppercase"
+          onclick={stop}
+        >
+          Stop
+        </button>
+      {:else if plan?.kind !== "firstRun"}
+        <button
+          class="bg-accent px-3 py-1 font-display text-xs tracking-widest text-bg uppercase disabled:opacity-40"
+          onclick={() => start()}
+          disabled={starting || !location?.path}
+        >
+          {starting ? "Starting…" : "Start watching"}
+        </button>
+      {/if}
+    {/snippet}
+
+    {#if status?.running}
+      <div class="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
+        <span class="font-display text-accent">
+          <span class="mr-1 inline-block size-2 rounded-full bg-accent"></span>
+          {status.logPresent ? "Watching" : "Waiting for Game.log"}
+        </span>
+        <span class="text-muted">
+          {n(status.linesSeen)} lines · {n(status.classMatched)} shop lines
+        </span>
+        <span class="text-muted">
+          {n(status.promoted)} detected · {n(status.discarded)} discarded
+        </span>
+        {#if status.rotations}
+          <span class="text-muted">{n(status.rotations)} rotation(s)</span>
+        {/if}
+      </div>
+
+      <dl class="mt-3 grid grid-cols-2 gap-x-6 gap-y-1 border-t border-border pt-3 text-sm sm:grid-cols-4">
+        <div>
+          <dt class="text-xs tracking-widest text-muted uppercase">Read to</dt>
+          <dd class="font-display text-accent">{n(status.readOffset)}</dd>
+        </div>
+        <div>
+          <dt class="text-xs tracking-widest text-muted uppercase">Saved to</dt>
+          <dd class="font-display text-accent">{n(status.safeOffset)}</dd>
+        </div>
+        <div>
+          <dt class="text-xs tracking-widest text-muted uppercase">In grace</dt>
+          <dd class="font-display {status.pending ? 'text-warn-text' : 'text-accent'}">
+            {n(status.pending)}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-xs tracking-widest text-muted uppercase">Unparseable</dt>
+          <dd class="font-display {status.malformed ? 'text-danger-text' : 'text-accent'}">
+            {n(status.malformed)}
+          </dd>
+        </div>
+      </dl>
+
+      <p class="mt-2 text-xs text-muted">
+        <!-- This gap is the point, not a bug: the saved offset deliberately
+             lags while a detection is inside its {status.graceWindowMs}ms
+             window, so a crash re-reads the line instead of losing the trade. -->
+        Saved position lags read position while a detection is inside its
+        {n(status.graceWindowMs)}ms grace window — that is what makes a crash
+        re-read the line rather than lose the trade.
+      </p>
+    {:else if plan?.kind === "firstRun"}
+      <p class="text-sm text-text">
+        This is the first time watching. The current session's log already
+        contains
+        <span class="font-display text-accent">{n(plan.trades)}</span>
+        trade{plan.trades === 1 ? "" : "s"}.
+      </p>
+      <p class="mt-1 text-xs text-muted">
+        Nothing has been imported. Choose — and either way nothing is written
+        to your database without your approval.
+      </p>
+      <div class="mt-3 flex flex-wrap gap-2">
+        <button
+          class="bg-accent px-3 py-1 font-display text-xs tracking-widest text-bg uppercase"
+          onclick={() => start(plan?.kind === "firstRun" ? plan.endOffset : undefined)}
+        >
+          Start from now
+        </button>
+        <button
+          class="border border-accent px-3 py-1 font-display text-xs tracking-widest text-accent uppercase"
+          onclick={() => start(0)}
+          disabled={plan.trades === 0}
+        >
+          Import {n(plan.trades)} for review
+        </button>
+      </div>
+    {:else if plan?.kind === "backfill"}
+      <p class="text-sm text-warn-text">
+        A session happened while the client was closed
+        {plan.reason === "replaced"
+          ? "— the game rotated the log and started a new one"
+          : plan.reason === "truncated"
+            ? "— the log was truncated in place"
+            : "— the configured path changed"}.
+      </p>
+      <p class="mt-1 text-xs text-muted">
+        Starting will read the file from the beginning and offer anything not
+        already seen.
+      </p>
+      <button
+        class="mt-3 bg-accent px-3 py-1 font-display text-xs tracking-widest text-bg uppercase disabled:opacity-40"
+        onclick={() => start(0)}
+        disabled={starting}
+      >
+        {starting ? "Starting…" : "Start and backfill"}
+      </button>
+    {:else if plan?.kind === "noLog"}
+      <p class="text-sm text-muted">
+        No Game.log yet. Start Star Citizen, or set the path in Settings.
+      </p>
+    {:else if plan?.kind === "resume"}
+      <p class="text-sm text-muted">
+        Not watching. Will resume at byte {n(plan.offset)}.
+      </p>
+    {:else}
+      <p class="text-sm text-muted">Not watching.</p>
+    {/if}
+  </Panel>
+
+  {#if feed.length}
+    <Panel title="Live feed">
+      <ul class="flex flex-col gap-1 text-sm">
+        {#each feed as f, i (f.at + i)}
+          <li class="flex gap-2">
+            <span class="font-mono text-xs text-muted">{f.at}</span>
+            {#if f.k === "detected"}
+              <span class="font-display text-[10px] tracking-widest uppercase
+                           {f.t.kind === 'buy' ? 'text-accent' : 'text-accent'}">
+                {f.t.kind}
+              </span>
+              <span class="text-text">
+                {n(f.t.quantityScu)} SCU @ {price(f.t.unitPricePerScu)}
+              </span>
+              <span class="font-mono text-xs text-muted">
+                {f.t.resourceGuid.slice(0, 8)}…
+              </span>
+              {#if f.t.locationIdHint}
+                <span class="text-xs text-muted">loc {f.t.locationIdHint}</span>
+              {/if}
+            {:else if f.k === "discarded"}
+              <span class="text-danger-text">
+                discarded {f.d.trade.kind} — {f.d.error.result} after
+                {n(f.d.deltaMs)}ms
+              </span>
+            {:else if f.k === "malformed"}
+              <span class="text-danger-text">unparseable shop line</span>
+              <span class="truncate font-mono text-xs text-muted">{f.raw}</span>
+            {:else}
+              <span class="text-warn-text">Game.log rotated</span>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+      <p class="mt-2 text-xs text-muted">
+        Detections only. Nothing is written to your database — the review queue
+        lands in the next phase.
+      </p>
+    </Panel>
+  {/if}
+
   <Panel title="Game.log">
     {#snippet actions()}
       <button
