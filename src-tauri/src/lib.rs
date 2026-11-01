@@ -89,6 +89,7 @@ pub fn run() {
             commands::retry_item,
             commands::drain_queue,
             commands::preview_sell,
+            commands::export_history_csv,
             commands::get_refdata,
             commands::refresh_refdata,
             probe::phase1_probe,

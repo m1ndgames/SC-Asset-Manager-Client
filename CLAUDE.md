@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phases 0-4 are done.** What exists and passes (214 tests green, clippy clean):
+**Phases 0-4 are done**, plus the History view and autostart. What exists and
+passes (219 tests green, clippy clean):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -34,8 +35,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `location: Option<&str>` — `Some` for the buy merge rule, `None` for a sell.
   The card shows which asset is hit, what remains, and the gross profit.
 
-**Not built yet:** the buy merge rule (Phase 5), PocketBase (Phase 6), and the
-History view, which is still a placeholder.
+- **History and CSV export:** the view reads `get_history` and renders it; totals
+  are computed in the view because nothing is written from that screen.
+  `export_history_csv` builds and writes the file **in Rust** — the renderer has
+  no filesystem access and must not acquire any. `csv_field` guards the
+  leading-`=`/`+`/`-`/`@` case, since a field starting that way is executed as a
+  formula by Excel and Sheets, and item names, locations and error messages are
+  all ultimately untrusted strings.
+- **`autostart_watcher`:** a config flag, off by default, added with
+  `#[serde(default)]` rather than a schema bump. It delegates to the same
+  `start_watcher` the button calls, with no offset, which is what keeps the
+  "nothing is read until the user says so" invariant: that path defaults an
+  unseen log to start-from-now and never backfills silently.
+
+**Not built yet:** the buy merge rule (Phase 5) and PocketBase (Phase 6).
+History has no retry/restore actions yet — it is read-only plus export.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an

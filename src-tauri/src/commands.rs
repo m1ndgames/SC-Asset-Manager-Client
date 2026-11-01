@@ -398,6 +398,45 @@ mod tests {
         assert!(parse_firebase_config("hello".into()).is_err());
         assert!(parse_firebase_config(String::new()).is_err());
     }
+    // -----------------------------------------------------------------------
+    // CSV export
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn csv_quotes_only_what_needs_it() {
+        assert_eq!(csv_field("Ammonia"), "Ammonia");
+        assert_eq!(csv_field("Port Tressler"), "Port Tressler");
+        // A comma forces quoting.
+        assert_eq!(csv_field("Everus Harbor, Hurston"), "\"Everus Harbor, Hurston\"");
+        // A quote is doubled, and the field quoted.
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        // Newlines too -- an error message can contain one.
+        assert_eq!(csv_field("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    /// A field beginning `=`, `+`, `-` or `@` is run as a formula by Excel and
+    /// Sheets the moment the file is opened. Item names and locations are
+    /// user-supplied, and an error message is whatever a server said, so this
+    /// is reachable rather than theoretical.
+    #[test]
+    fn csv_defuses_spreadsheet_formulas() {
+        assert_eq!(csv_field("=1+1"), "'=1+1");
+        assert_eq!(csv_field("+1"), "'+1");
+        assert_eq!(csv_field("-1"), "'-1");
+        assert_eq!(csv_field("@SUM(A1)"), "'@SUM(A1)");
+        // A negative number still has to survive legibly.
+        assert_eq!(csv_field("-12.5"), "'-12.5");
+        // And the guard must not fire on ordinary text.
+        assert_eq!(csv_field("Ammonia"), "Ammonia");
+    }
+
+    #[test]
+    fn csv_header_is_present_even_with_no_rows() {
+        let csv = history_csv(&[]);
+        assert!(csv.starts_with("state,kind,loggedAt,"), "{csv}");
+        assert_eq!(csv.lines().count(), 1, "header only");
+    }
+
 }
 
 /// What approving this sell would do, for the review card.
@@ -440,4 +479,83 @@ pub async fn preview_sell(
             Ok(None)
         }
     }
+}
+
+/// Quote a CSV field per RFC 4180.
+///
+/// Hand-rolled rather than pulling in a crate: this is the only CSV in the
+/// project and the rule is three lines. Note the leading-separator guard —
+/// a field starting `=`, `+`, `-` or `@` is executed as a formula by Excel
+/// and Sheets when the file is opened, and item names and locations are
+/// ultimately user-supplied strings.
+fn csv_field(s: &str) -> String {
+    let needs_formula_guard = s.starts_with(['=', '+', '-', '@']);
+    let body = if needs_formula_guard {
+        format!("'{s}")
+    } else {
+        s.to_string()
+    };
+    if body.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", body.replace('"', "\"\""))
+    } else {
+        body
+    }
+}
+
+/// Build the history CSV.
+///
+/// Pure and public so it is testable without a filesystem: the escaping is the
+/// only part that can be wrong, and it is wrong in ways that corrupt a
+/// spreadsheet silently rather than failing.
+pub fn history_csv(items: &[crate::queue::ItemView]) -> String {
+    let mut out = String::from(
+        "state,kind,loggedAt,logTimestamp,item,resolvedFrom,amountScu,unitPricePerScu,\
+         totalAuec,location,id,attempts,error\n",
+    );
+    for i in items {
+        let cols = [
+            format!("{:?}", i.item.state).to_lowercase(),
+            i.item.detected.line.kind.as_str().to_string(),
+            i.item.updated_at.clone(),
+            i.item.detected.line.log_timestamp.clone(),
+            i.resolved_item_name
+                .clone()
+                .or_else(|| i.item.edits.item_name.clone())
+                .unwrap_or_default(),
+            i.item.detected.line.resource_guid.clone(),
+            // Full precision: a price rounded for a spreadsheet is a price
+            // that no longer reconciles against the database.
+            format!("{}", i.effective_amount_scu),
+            format!("{}", i.effective_unit_price_per_scu),
+            format!("{}", i.total_auec),
+            i.item.edits.location.clone().unwrap_or_default(),
+            i.item.id.clone(),
+            i.item.attempts.to_string(),
+            i.item.error.clone().unwrap_or_default(),
+        ];
+        out.push_str(
+            &cols
+                .iter()
+                .map(|c| csv_field(c))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push('\n');
+    }
+    out
+}
+
+/// Write the history to a CSV file the user picked.
+///
+/// The path comes from the dialog plugin in the webview, but the *writing*
+/// happens here: the renderer has no filesystem access and should not acquire
+/// any.
+#[tauri::command]
+pub fn export_history_csv(state: State<'_, AppState>, path: String) -> AppResult<usize> {
+    let items = get_history(state, None);
+    let csv = history_csv(&items);
+    std::fs::write(&path, csv.as_bytes())
+        .map_err(|e| AppError::Config(format!("could not write {path}: {e}")))?;
+    tracing::info!(path = %path, rows = items.len(), "history exported");
+    Ok(items.len())
 }

@@ -382,6 +382,10 @@ export const drainQueue = (): Promise<DrainReport> => invoke("drain_queue");
 export const previewSell = (id: string): Promise<SellPreview | null> =>
   invoke("preview_sell", { id });
 
+/** Writes the CSV in Rust: the renderer has no filesystem access. */
+export const exportHistoryCsv = (path: string): Promise<number> =>
+  invoke("export_history_csv", { path });
+
 export const getRefdata = (): Promise<RefData> => invoke("get_refdata");
 
 export const refreshRefdata = (): Promise<RefData> => invoke("refresh_refdata");
