@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 use crate::error::{AppError, AppResult};
+use crate::ids::TradeKind;
 use crate::log::scan::DetectedTrade;
 use crate::model::now_iso;
 use crate::refdata::RefData;
@@ -396,6 +397,21 @@ impl Queue {
                 return Err(AppError::Queue(format!(
                     "{id} is {:?} and cannot be approved",
                     item.state
+                )));
+            }
+            // A sell must not reach `Approved` while the sell path is unbuilt.
+            // `drain` is kind-agnostic and calls `write_buy` unconditionally, so
+            // an approved sell would write an *asset* record claiming the user
+            // still owns what they just sold. The review card hides the button,
+            // but the queue is the source of truth and has to refuse it itself —
+            // a guard that lives only in a Svelte template is not a guard.
+            //
+            // Deliberately not a `Blocker`: blockers are things the user can fix
+            // on the card, and this one they cannot.
+            if item.detected.line.kind == TradeKind::Sell {
+                return Err(AppError::Queue(format!(
+                    "{id} is a sell, and the sell write path lands in Phase 4. \
+                     Approving it now would write an asset, not a trade."
                 )));
             }
             let blockers = item.blockers(refdata);

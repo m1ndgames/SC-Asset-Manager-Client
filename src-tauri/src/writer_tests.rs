@@ -54,6 +54,38 @@ fn approved(line: &str, location: &str) -> (tempfile::TempDir, QueueItem) {
     (dir, item)
 }
 
+/// Like `approved`, but stopping before `approve` - which refuses a sell
+/// outright (see `queue::approve`). `write_buy` does not read `state`, so this
+/// still exercises the real refusal: that `write_buy` itself rejects a sell no
+/// matter how one reached it. Keeping both guards tested matters, because they
+/// defend different failures - the queue one stops a user approving a sell, and
+/// this one stops a future caller writing one directly.
+fn unapproved(line: &str, location: &str) -> (tempfile::TempDir, QueueItem) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Queue::open(dir.path());
+    let ParsedLine::Trade(t) = parse_line(line).unwrap() else {
+        panic!("not a trade")
+    };
+    let id = q
+        .enqueue(DetectedTrade {
+            line: *t,
+            location_id_hint: None,
+        })
+        .unwrap()
+        .id
+        .clone();
+    q.update(
+        &id,
+        ItemPatch {
+            location: Some(Some(location.into())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let item = q.get(&id).unwrap().clone();
+    (dir, item)
+}
+
 // ---------------------------------------------------------------------------
 // The field contract
 // ---------------------------------------------------------------------------
@@ -321,7 +353,7 @@ async fn a_failed_merge_check_does_not_block_the_write() {
 
 #[tokio::test]
 async fn a_sell_is_refused_until_phase_4() {
-    let (_d, item) = approved(SELL, "Port Tressler");
+    let (_d, item) = unapproved(SELL, "Port Tressler");
     let backend = MockBackend::new();
     let err = write_buy(&backend, &item, &refdata(), "m1nd")
         .await

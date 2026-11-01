@@ -28,6 +28,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::backend::firebase::FirebaseBackend;
 use crate::backend::{BackendError, SyncBackend};
 use crate::config::BackendKind;
+use crate::ids::TradeKind;
 use crate::queue::ItemState;
 use crate::state::AppState;
 
@@ -102,6 +103,29 @@ pub async fn drain(app: &AppHandle) -> DrainReport {
             }
         };
         let Some(item) = claimed else { break };
+
+        // Defence in depth. `queue::approve` refuses a sell, so reaching here
+        // means a `queue.json` written before that guard existed. Fail it rather
+        // than hand it to `write_buy`, which would cheerfully write an asset
+        // saying the user owns what they sold. Failing is also the recoverable
+        // choice: the item stays, and becomes approvable once Phase 4 lands.
+        if item.detected.line.kind != TradeKind::Buy {
+            let message =
+                "The sell write path lands in Phase 4; this was left approved by an \
+                 earlier build and has not been written."
+                    .to_string();
+            let mut q = state.queue.lock().unwrap();
+            if let Err(e) = q.mark_failed(&item.id, &message) {
+                tracing::error!(error = %e, id = %item.id, "could not park the approved sell");
+            }
+            report.failed += 1;
+            tracing::warn!(id = %item.id, "refused to write a sell through the buy path");
+            let _ = app.emit(
+                EV_WRITE_FAILED,
+                serde_json::json!({ "id": item.id, "message": message }),
+            );
+            continue;
+        }
 
         // No lock held here.
         let result = crate::writer::write_buy(backend.as_ref(), &item, &refdata, &nickname).await;

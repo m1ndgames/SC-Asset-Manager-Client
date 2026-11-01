@@ -10,6 +10,11 @@ use crate::log::scan::DetectedTrade;
 const BUY: &str = "<2026-11-01T17:49:12.944Z> [Notice] <CEntityComponentCommodityUIProvider::SendCommodityBuyRequest> Sending SShopCommodityBuyRequest - playerId[214115750165] shopId[863043433450] shopName[SCShop_Admin_lt_base_g] kioskId[863043433446] price[50069.000000] shopPricePerCentiSCU[7.823200] resourceGUID[a11394c9-ad7c-404d-9209-3a5e57bb4aa4] autoLoading[1] quantity[6400.000000 cSCU] Cargo Box Data: boxSize[8.000000] | unitAmount[8] [Team_CoreGameplayFeatures][Shops][UI]";
 const BUY2: &str = "<2026-11-01T09:42:57.034Z> [Notice] <CEntityComponentCommodityUIProvider::SendCommodityBuyRequest> Sending SShopCommodityBuyRequest - playerId[214115750165] shopId[863690742444] shopName[SCShop_Admin_lt_base_g] kioskId[863690742440] price[151296.000000] shopPricePerCentiSCU[3.152000] resourceGUID[0d41371c-3cde-4939-8583-cd718f5edd60] autoLoading[1] quantity[48000.000000 cSCU] Cargo Box Data: boxSize[8.000000] | unitAmount[60] [Team_CoreGameplayFeatures][Shops][UI]";
 
+/// A real `ResourceContainer` sell of Ammonia - the GUID resolves, so once a
+/// location is set this item has *no* blockers. That is the point: it isolates
+/// the kind guard as the only remaining reason approval can fail.
+const SELL: &str = "<2026-04-12T14:42:15.550Z> [Notice] <CEntityComponentCommodityUIProvider::SendCommoditySellRequest> Sending SShopCommoditySellRequest - playerId[000000000000] shopId[9831290495370] shopName[SCShop_Admin_lt_base_g] kioskId[9831290495369] amount[716880.000000] resourceGUID[a11394c9-ad7c-404d-9209-3a5e57bb4aa4] autoLoading[1] quantity[640] transactionMode[ResourceContainer] Cargo Box Data:  [boxSize[32] | unitAmount[20]] [Team_CoreGameplayFeatures][Shops][UI]";
+
 fn detected(line: &str) -> DetectedTrade {
     let ParsedLine::Trade(t) = parse_line(line).expect("fixture parses") else {
         panic!("not a trade")
@@ -518,4 +523,47 @@ fn the_view_reports_the_resolved_name_and_the_log_total() {
     assert_eq!(v.total_auec, 50069.0);
     assert!(!v.can_approve, "no location yet");
     assert_eq!(v.blockers, vec![Blocker::LocationMissing]);
+}
+
+// ---------------------------------------------------------------------------
+// The sell guard
+// ---------------------------------------------------------------------------
+
+/// `drain` calls `write_buy` unconditionally, so an approved sell would write an
+/// *asset* record claiming the user still owns what they just sold - into the
+/// shared group database. The review card hides the approve button, but a guard
+/// that lives only in a Svelte template is not a guard; the queue owns this.
+#[test]
+fn a_sell_cannot_be_approved_while_the_sell_path_is_unbuilt() {
+    let (_dir, mut q) = queue();
+    let rd = refdata();
+    let id = q.enqueue(detected(SELL)).unwrap().id.clone();
+
+    // Give it everything a buy would need, so nothing *else* can be the cause.
+    q.update(&id, located("Port Tressler")).unwrap();
+    assert!(
+        q.get(&id).unwrap().blockers(&rd).is_empty(),
+        "fixture must be otherwise ready, or this test proves nothing"
+    );
+
+    let err = q.approve(&id, &rd).expect_err("a sell must not be approvable");
+    assert!(
+        matches!(err, AppError::Queue(_)),
+        "refusal is a Queue error, not a fixable Blocker: got {err:?}"
+    );
+
+    // And it is still reviewable rather than stranded in some other state.
+    assert_eq!(q.get(&id).unwrap().state, ItemState::PendingReview);
+}
+
+/// The mirror case, so the guard cannot be "fixed" by rejecting everything.
+#[test]
+fn a_buy_is_still_approvable() {
+    let (_dir, mut q) = queue();
+    let rd = refdata();
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.update(&id, located("Port Tressler")).unwrap();
+
+    q.approve(&id, &rd).expect("a located, resolved buy approves");
+    assert_eq!(q.get(&id).unwrap().state, ItemState::Approved);
 }
