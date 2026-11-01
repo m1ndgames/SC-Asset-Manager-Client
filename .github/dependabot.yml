@@ -1,0 +1,93 @@
+# Dependency updates. CI (`ci.yml`) runs on every pull_request, so each of
+# these arrives already checked against svelte-check, clippy -D warnings, the
+# test suite and the single-TLS-stack assertion. Dependabot PRs get no access
+# to repository secrets, which is fine — CI needs none, and `release.yml` only
+# triggers on a tag.
+
+version: 2
+
+updates:
+  # --- Rust -----------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(cargo)"
+    groups:
+      # Tauri core, its build script and every plugin move together. A plugin
+      # bumped on its own can fail to resolve against the pinned core, so a
+      # single PR either passes as a set or fails as one.
+      tauri:
+        patterns:
+          - tauri
+          - tauri-build
+          - tauri-plugin-*
+      # Everything else, minor and patch only, in one PR to keep the volume
+      # down. Majors are deliberately excluded so they arrive individually.
+      rust-minor:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - tauri
+          - tauri-build
+          - tauri-plugin-*
+        update-types:
+          - minor
+          - patch
+
+  # --- Frontend -------------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(npm)"
+    groups:
+      # The JS side of the same release train as the cargo `tauri` group: the
+      # CLI, the API and the plugin bindings. @tauri-apps/cli in particular has
+      # to stay in step with the tauri crate, since it is what builds it.
+      tauri-js:
+        patterns:
+          - "@tauri-apps/*"
+      svelte:
+        patterns:
+          - svelte
+          - svelte-check
+          - "@sveltejs/*"
+      tailwind:
+        patterns:
+          - tailwindcss
+          - "@tailwindcss/*"
+      dev-minor:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "@tauri-apps/*"
+          - svelte
+          - svelte-check
+          - "@sveltejs/*"
+          - tailwindcss
+          - "@tailwindcss/*"
+        update-types:
+          - minor
+          - patch
+
+  # --- The workflows themselves --------------------------------------------
+  # Catches the actions pinned by major tag (`checkout@v4`, `tauri-action@v0`),
+  # which otherwise silently stay behind for years.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns:
+          - "*"

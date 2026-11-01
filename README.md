@@ -14,10 +14,6 @@ Each detected trade is shown for review. You confirm or correct it — in
 particular the **location**, which the game log does not record — and it is
 written to your SC-Asset-Manager database only once you approve it.
 
-Nothing is written automatically. This is a semi-automatic client by design:
-the log tells us what was traded, at what price, in what quantity, but not
-*where*, so a human closes that gap.
-
 ## Installing
 
 Download the MSI or the NSIS `-setup.exe` from the
@@ -36,14 +32,8 @@ and compare it against `SHA256SUMS.txt`, published as an asset on the same
 release. Checksums are attached before the release is made public, so they are
 always there.
 
-To get past the warning: **More info** → **Run anyway**.
-
-Updates are checked only when you ask, in **Settings → Updates**, and the check
-runs in the app's Rust core — the window itself never makes a network request.
-
 ## Requirements
 
-- Windows, with WebView2 (shipped with Windows 11 and current Windows 10).
 - A **sync backend** — either Firebase or PocketBase — enabled in
   SC-Asset-Manager. In standalone mode the web app's data lives in a browser's
   `localStorage` and is unreachable from here.
@@ -60,10 +50,7 @@ runs in the app's Rust core — the window itself never makes a network request.
 - **Game.log path** — detected automatically, overridable.
 - **Poll interval** and **grace window**.
 
-> The backend password is stored in cleartext in
-> `%APPDATA%\sc-asset-manager-client\config.toml`. It is never returned to the
-> UI, never logged, and never included in an error message. Tokens stay in
-> memory only.
+> The backend password is stored in cleartext in `%APPDATA%\sc-asset-manager-client\config.toml`.
 
 ## How it works
 
@@ -71,10 +58,6 @@ SC-Asset-Manager has no API server — the sync backend *is* the integration
 point. This client signs in as an ordinary group member and writes to the same
 shared collections the web app uses, so records appear live in everyone's
 browser.
-
-The contract it implements is
-[INTEGRATIONS.md](https://github.com/m1ndgames/SC-Asset-Manager/blob/main/INTEGRATIONS.md)
-in the main repo.
 
 Records written here carry `source: "log-watcher"` and show a `LOG` badge in
 the web app. This client never sets `uexBuyId` / `uexSellId` — there is no UEX
@@ -96,40 +79,6 @@ cargo clippy --all-targets
 
 The Tauri CLI is a pinned devDependency, so there is no global install to keep
 in sync.
-
-## Releasing
-
-Tagging `v*` runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which gates on `svelte-check`, `clippy -D warnings` and `cargo test`, checks the
-tag against `tauri.conf.json`'s version, builds the bundles, drafts the release,
-attaches `SHA256SUMS.txt`, and only then publishes it.
-
-Two repository secrets are required:
-
-| Secret | What it is |
-|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | the contents of `sc-asset-manager-client.key` |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | the password that key was generated with |
-
-These sign the *update manifest*, which is unrelated to Authenticode and does
-nothing about SmartScreen. Without them the build still produces working
-installers, so a release can look entirely successful while shipping no updater
-artifacts at all — which silently strands every copy installed from it.
-
-> **If that password is lost, every already-installed copy becomes permanently
-> un-updatable.** The updater verifies against the public key baked into the
-> binary; rotating the key only helps releases published *after* the swap, and
-> there is no recovery path short of asking people to reinstall by hand.
-
-Because `bundle.createUpdaterArtifacts` is on, `npm run tauri build` **exits 1**
-without those variables set — after writing the installers, which are usable. That
-is deliberate: the alternative is a build that exits 0 having silently produced no
-updater artifacts. Set the variables, or accept the non-zero exit when you only
-want the installers.
-
-Bump the version in **both** `src-tauri/tauri.conf.json` and
-`src-tauri/Cargo.toml` — there is a test asserting they agree, and the workflow
-refuses a tag that does not match.
 
 See [PLAN.md](PLAN.md) for the implementation plan and
 [CLAUDE.md](CLAUDE.md) for the invariants that are easy to break silently.
