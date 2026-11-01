@@ -1,0 +1,268 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Current state
+
+**Phases 0 and 1 are partly done.** What exists and passes:
+
+- Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
+  self-hosted, four-tab shell, updater keypair generated and `pubkey` wired in.
+- `ids.rs`, `units.rs`, `log/parse.rs`, `log/scan.rs`, `log/discover.rs` with 62 tests
+  green, including both published UUIDv5 vectors and a corpus suite over 11 real
+  sessions.
+- `rescan_log` / `detect_log_path` commands, surfaced in the Diagnostics tab.
+
+**Not built yet:** the backend layer (`backend/`, `writer.rs`), the queue state machine,
+`refdata.rs`, `config.rs`, the tailer (`log/tail.rs`, `log/correlate.rs`), and the
+Review/Settings/History views, which are placeholders. Next up is Phase 1's remaining
+half: `backend/firebase.rs` far enough for `sign_in`, `health_check` and one
+`upsert_asset`, then editing and deleting that record in the web app.
+
+`PLAN.md` is the design of record and settles most questions about structure, crate
+choices and deliberate omissions. Read the relevant section before proposing an
+alternative — several non-obvious decisions (no `notify`, no SQLite, no `dirs`, no
+Firebase/PocketBase SDK) are recorded there specifically so they don't get
+"fixed" later. Where reality has since contradicted it, this file says so.
+
+## What this is
+
+A Tauri 2 desktop app (Windows) that tails Star Citizen's `Game.log`, detects
+commodity buy/sell transactions, shows each one for human review, and writes the
+approved record directly into the user's SC-Asset-Manager sync backend (Firebase
+Firestore or self-hosted PocketBase).
+
+SC-Asset-Manager is a static SPA with **no API server** — the sync backend *is* the
+integration point. This client signs in as an ordinary group member and writes to the
+same shared `assets`/`trades` collections the web app listens on.
+
+The authoritative data contract is
+[`INTEGRATIONS.md`](https://github.com/m1ndgames/SC-Asset-Manager/blob/main/INTEGRATIONS.md)
+in the main repo — field tables, unit semantics, document-id rules, the UUIDv5
+scheme, buy/sell write ordering. PLAN.md references it rather than restating it, so
+the two cannot drift. **When a field, unit or id question comes up, go to
+INTEGRATIONS.md, not to memory.**
+
+## Commands
+
+The Tauri CLI is a pinned devDependency, not a global install — always `npm run tauri`,
+never `cargo tauri`.
+
+```bash
+npm install
+npm run tauri dev                # run the app (Vite + Rust core)
+npm run tauri build              # MSI + NSIS bundles
+npm run tauri info               # verify the Tauri/WebView2 toolchain
+npm run check                    # svelte-check
+npm run dev                      # Vite alone (commands unavailable; views inert)
+
+cd src-tauri
+cargo test                                   # all Rust tests
+cargo test parse::                           # one module
+cargo test --test corpus                     # corpus invariants over the fixtures
+cargo test published_vector_buy -- --exact   # a single test
+cargo test --test corpus -- --ignored --nocapture   # live scan of the real Game.log
+cargo clippy --all-targets
+cargo tree -d                                # duplicate deps / TLS stacks
+```
+
+Tests touching a real install are `#[ignore]`d; CI runs against the redacted fixtures
+in `src-tauri/tests/fixtures/` (see the README there).
+
+## Architecture: the parts that need more than one file to understand
+
+**Everything consequential lives in Rust.** The webview makes zero outbound network
+requests — even reference data (`commodities.json` etc.) is fetched by `refdata.rs` —
+which is what keeps the CSP at `default-src 'self'` and credentials out of the
+renderer. Don't add `fetch` to the frontend.
+
+**The queue is the single source of truth, and it lives in Rust.** `queue.rs` owns the
+state machine (Detected → PendingReview → Approved → Writing → Written, plus
+Rejected/Discarded/Failed), persisted atomically to `queue.json` after every
+transition *and* every user field edit. Svelte holds a read-only projection: it calls
+commands and re-renders from the result, never mutating queue state locally. That is
+why there is no reconciliation logic and no "unsaved edits" concept — preserve this
+property.
+
+**Pipeline shape:** `log/tail.rs` (polling, 1 Hz, truncation + partial-line
+invariant) → `log/parse.rs` (pure `&str` → `ParsedLine`, no I/O, no clock) →
+`log/correlate.rs` (3 s grace window, discards a detection when a matching error line
+arrives) → `queue.rs` → `writer.rs` → `backend/{firebase,pocketbase}.rs` behind the
+`SyncBackend` trait. `writer.rs` implements INTEGRATIONS.md §8 **once**, for both
+backends.
+
+**Keep `parse.rs` pure and `writer.rs` backend-agnostic.** They are the two
+highest-value test targets, and both are tested without touching a network or a
+filesystem (`backend/mock.rs` stands in for the backend).
+
+## Invariants that are easy to break silently
+
+- **Tailer offset.** Advance `offset` only up to and *including the last `\n`*; keep
+  the remainder in `partial`. A half-written line must never be parsed. Decode with
+  `from_utf8_lossy`.
+- **Persistence ordering.** Per batch: enqueue → fsync `queue.json` → *then* advance
+  and fsync the offset. The reverse order loses trades; this order at worst re-reads
+  lines, and the deterministic id collapses the duplicate.
+- **`quantityRaw` is never parsed.** The UUIDv5 name string takes every field verbatim
+  from the log — `100800.000000` must stay exactly that string. There is a test
+  asserting it never round-trips through `f64`; don't relax it.
+- **Buy and sell use different units.** Buy `quantity` is cSCU, sell `quantity` is
+  SCU. Buy unit price is `shopPricePerCentiSCU × 100`, *not* `price / quantity`
+  (`price` is rounded to whole aUEC). Sell unit price is `amount / quantity`.
+- **A sell writes the trade first, then mutates the asset.** No transaction exists;
+  crashing between the two must leave a trade whose asset wasn't decremented, not a
+  vanished asset.
+- **A merged buy is the one non-idempotent operation in the design.** `merge_target_id`
+  and `merge_applied` are written to `queue.json` *before* the backend call. A full
+  rescan must warn and default to skipping merged buys.
+- **Firestore document id and the record's `id` field must be identical.** A mismatch
+  produces a record the web app can display but never update or delete. Guard it at
+  runtime.
+- **Always send an explicit `updateMask`**, listing exactly the fields this client owns
+  (`ASSET_FIELD_PATHS` in `backend/firebase.rs`). Never list `quality` or `uexBuyId`:
+  both are owned by the web app, and listing them would delete the user's values on
+  every merged buy. See the verified semantics below.
+- **Never silently drop a class-matching line.** A line matching
+  `CEntityComponentCommodityUIProvider::` that fails to parse becomes
+  `MalformedMatch { raw, missing }` and surfaces in Diagnostics. Silent drops are
+  exactly how a game patch breaks the watcher invisibly.
+- **Timestamps.** `chrono::to_rfc3339_opts(SecondsFormat::Millis, true)` is chosen
+  because it reproduces byte-for-byte what JS `new Date().toISOString()` writes in the
+  web app.
+- **`μ` is U+03BC**, not U+00B5. There's an assertion for it; the difference is
+  invisible in a diff.
+
+## Parsing style
+
+Classify, then sweep — do **not** write one monolithic regex. Cheap `contains()`
+rejection, match the `<Class::Method>` token, take the timestamp as the verbatim text
+between the first `<` and `>`, then sweep the remainder with a generic
+`([A-Za-z]+)\[([^\[\]]*)\]` into a map and validate required keys per kind. The log
+format already differs between buy and sell lines (`boxSize[16.000000]` vs bracketed
+`[boxSize[8] | …]`) and carries trailing `[Team_…][Shops][UI]` tags the
+INTEGRATIONS.md samples omit. Expect the parser to need patching after game updates;
+the design's job is to make that need visible.
+
+### Parity, stated correctly
+
+The drift check is **`Σ(boxSize_i × unitAmount_i) == quantity-in-SCU`, summed over every
+`Cargo Box Data` group on the line** — a line can carry up to four, and a mixed-cargo
+sell lists one group per box size.
+
+This matters: reading only one `boxSize`/`unitAmount` pair — which is what a naive
+`field[value]` map gives you, since later keys overwrite earlier ones — makes parity
+appear to fail on ~11% of sells. PLAN.md §3.5 and an earlier draft of this file both got
+this wrong. Summed, it holds on **90 of 91** real trade lines (21/21 buys, 21/21
+`Location` sells, 48/49 `ResourceContainer` sells), so it is a sound signal worth
+surfacing. `log/parse.rs` keeps `box_groups` as an ordered `Vec` for exactly this reason.
+
+A mismatch sets a warning flag on the review card — it does **not** reject the trade, and
+`quantity` always remains authoritative.
+
+Two further drift detectors that do not depend on cargo box data at all:
+- the buy price cross-check (`shopPricePerCentiSCU × 100` vs `price / quantityScu`,
+  within 0.1% on 21/21 real buys);
+- the unit token rule (`quantity[... cSCU]` on buys 21/21, bare on sells 70/70).
+
+## Hard scope boundaries
+
+- **No UEX integration, ever.** This client must not set `uexBuyId` / `uexSellId`.
+- Item/ammo purchases (`SendShopBuyRequest`) are out of scope — commodities only.
+- LIVE channel only, with a manual path override. No PTU/EPTU handling.
+- No tray/background operation. A plain window you open when you want to review.
+- **Nothing is written until the user approves it.** The log does not record the
+  location, which is why a human is in the loop at all; the Location combobox is the
+  primary interaction of the whole app. Never silently pre-fill a remembered location —
+  offer it as a visibly labelled suggestion.
+
+## Config and secrets
+
+`%APPDATA%\sc-asset-manager-client\` holds `config.toml` (with `schema = 1`),
+`state.json`, `queue.json`, `history.json`, `refdata/` and `logs/`. All written
+atomically (temp file + rename).
+
+The backend password is stored in cleartext in `config.toml` — a deliberate choice
+over an OS keyring. It must be stored nowhere else: **never** returned to the webview
+(`get_config` returns `password_set: bool`), never logged (redact the key in the
+tracing layer), never in an error message. Tokens stay in memory only.
+
+Manual testing goes against a scratch Firebase project, never a live group database.
+
+## UI conventions
+
+Plain Vite + Svelte 5 (runes), **not SvelteKit** — one window, three views plus
+Diagnostics, view switching via a `$state<View>` union in `App.svelte`.
+
+The visual language is copied from SC-AssetManager's `src/app.css` `@theme` block
+verbatim (`--color-bg #000b11`, `--color-surface #001f33`, `--color-border #0a3a5c`,
+`--color-accent #42c8f4`, `--color-text #c8dde8`, `--color-muted #7aabcc`; Orbitron
+display / Rajdhani body) along with `.rsi-panel` brackets, the scanline table header
+and the noise overlay. One deliberate divergence: fonts are bundled as local `.woff2`
+rather than loaded from Google Fonts, because a desktop app must render offline.
+
+Unit price is displayed to 6 dp and **never rounded**. The SCU/cSCU/μSCU toggle must
+rescale amount and price *together* — letting them end up on different denominators is
+the easiest contract violation available.
+
+## Errors
+
+`thiserror`, not `anyhow`: Tauri commands must return typed, serialisable errors the
+frontend can discriminate on. `AppError` serialises as `{ kind, message }`; `kind` is the
+stable discriminant the UI switches on.
+
+## Corrections to PLAN.md learned from real logs
+
+PLAN.md was written against one session. A corpus of 11 sessions (game builds Dec 2025 →
+Oct 2026) in `src-tauri/tests/fixtures/` has since contradicted it in four places:
+
+1. **Parity must be summed over cargo box groups** — see above. The single most
+   consequential correction.
+2. **`transactionMode` appears on sells only**, with two values (`ResourceContainer`,
+   `Location`). PLAN.md risk #4 lists it as unverified. It does not affect unit
+   semantics.
+3. **`ClSetSelectedPlayerLocationInfo` has benign `[Error]` variants** carrying no
+   `LocationId` ("Non-vehicle Resource Container not found"). These are ordinary game
+   chatter and are classified `Ignored`, not `Malformed` — otherwise they bury the
+   malformed list that exists to make real drift visible.
+4. **`reqwest` 0.13 renamed the `rustls-tls` feature to `rustls`.** PLAN.md's table says
+   `rustls-tls`, which is a 0.12 name and fails to resolve. We use
+   `["json", "rustls", "webpki-roots"]`; bundled roots keep the Windows cert store out
+   of it. Verified single TLS stack: one `reqwest` 0.13.1, one `rustls` 0.23.46, shared
+   with `tauri-plugin-updater`.
+
+Also minor: INTEGRATIONS.md §3 says "188.9409 × 1008 = 190,452.43, which rounds to the
+logged 190,453". The product is right, the rounding claim is off by one — the logged
+`price` is a whole aUEC higher because `shopPricePerCentiSCU` is itself only logged to six
+decimals. Neither figure is exact, which is why the unit price comes from
+`shopPricePerCentiSCU` and the total from `price`, never one from the other.
+
+## Firestore PATCH semantics — settled, not assumed
+
+INTEGRATIONS.md flags these as unverified and PLAN.md risk #1 asks for them to be
+confirmed with a throwaway document. That has now been done against a real project
+(`src-tauri/src/probe.rs`, driven by `tests/live_backend.rs`). All three answers:
+
+| Question | Answer |
+|---|---|
+| Does a field left **out** of `updateMask` survive a write? | **Yes — untouched** |
+| Is a field **in** the mask but absent from the body deleted? | **Yes — deleted** |
+| Is a `PATCH` with **no** `updateMask` a whole-document write? | **Yes — omitted fields are dropped** |
+
+So INTEGRATIONS.md's unverified reading was right, *and* the explicit-mask strategy is
+safe. The combination is what the write pipeline depends on: the mask gives an upsert
+its no-stale-fields property, while omitting `quality`/`uexBuyId` from the mask stops a
+merged buy from destroying values the web app owns.
+
+Also confirmed on the wire: an unrounded `buyPrice` (188.9409) round-trips exactly, the
+document id and `id` field agree, `unit` keeps its contract spelling, an absent `quality`
+stays absent rather than becoming 0, and a repeated `upsert_asset` is idempotent.
+
+Re-run with `cargo test --test live_backend -- --ignored --nocapture`. It writes to the
+configured project, so it is `#[ignore]`d.
+
+## Log rotation
+
+The game moves the previous `Game.log` into `<install>/LIVE/logbackups/` on each launch,
+named `Game Build(<build>) <date> (<time>).log`. Rotation **preserves** rather than
+destroys, so a session missed while the client was closed is recoverable from there —
+but the directory can be pruned, which is why fixtures are committed.

@@ -138,6 +138,23 @@ export interface ConfigPatch {
   pocketbase?: PocketbaseConfig;
 }
 
+export interface HealthReport {
+  ok: boolean;
+  backend: BackendKind;
+  email: string;
+  userId: string;
+  assetCount: number | null;
+  tradeCount: number | null;
+  configuredNickname: string;
+  knownNicknames: string[];
+  notes: string[];
+}
+
+export interface BackendError {
+  kind: "notConfigured" | "auth" | "network" | "protocol" | "other";
+  message: string;
+}
+
 export const getConfig = (): Promise<ConfigDto> => invoke("get_config");
 
 export const setConfig = (patch: ConfigPatch): Promise<ConfigDto> =>
@@ -147,3 +164,5 @@ export const configFilePath = (): Promise<string> => invoke("config_file_path");
 
 export const parseFirebaseConfig = (text: string): Promise<FirebaseConfig> =>
   invoke("parse_firebase_config", { text });
+
+export const testBackend = (): Promise<HealthReport> => invoke("test_backend");

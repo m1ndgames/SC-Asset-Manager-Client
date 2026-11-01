@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use tauri::State;
 
-use crate::config::{self, ConfigDto, ConfigPatch, FirebaseConfig};
+use crate::backend::firebase::FirebaseBackend;
+use crate::backend::{BackendError, HealthReport, SyncBackend};
+use crate::config::{self, BackendKind, ConfigDto, ConfigPatch, FirebaseConfig};
 use crate::error::{AppError, AppResult};
 use crate::log::{discover, scan};
 use crate::state::AppState;
@@ -117,6 +119,21 @@ pub fn parse_firebase_config(text: String) -> AppResult<FirebaseConfig> {
         ));
     }
     Ok(cfg)
+}
+
+/// Settings "Test connection". Signs in and reads; mutates nothing.
+#[tauri::command]
+pub async fn test_backend(state: State<'_, AppState>) -> Result<HealthReport, BackendError> {
+    let cfg = state.config();
+    match cfg.backend.kind {
+        BackendKind::Firebase => {
+            let b = FirebaseBackend::from_config(&cfg)?;
+            b.health_check().await
+        }
+        BackendKind::Pocketbase => Err(BackendError::NotConfigured(
+            "PocketBase support is not built yet — it lands in Phase 6".into(),
+        )),
+    }
 }
 
 #[cfg(test)]

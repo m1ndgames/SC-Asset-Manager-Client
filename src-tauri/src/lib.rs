@@ -7,11 +7,14 @@
 //! INTEGRATIONS.md in the main repo is the authoritative data contract;
 //! PLAN.md here is the design of record.
 
+pub mod backend;
 pub mod commands;
 pub mod config;
 pub mod error;
 pub mod ids;
 pub mod log;
+pub mod model;
+pub mod probe;
 pub mod state;
 pub mod units;
 
@@ -51,6 +54,9 @@ pub fn run() {
             commands::set_config,
             commands::config_file_path,
             commands::parse_firebase_config,
+            commands::test_backend,
+            probe::phase1_probe,
+            probe::delete_test_asset,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
