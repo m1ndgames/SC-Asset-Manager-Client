@@ -119,6 +119,16 @@ filesystem (`backend/mock.rs` stands in for the backend).
   on discard, or a backfill resurrects a trade the game already told us failed.
 - **Rotation clears the position, never the id filter.** `processed_ids` must survive
   a relaunch, or every trade of the previous session comes back.
+- **Never identify `Game.log` by its creation time.** NTFS *file-system tunneling*
+  resurrects a creation timestamp when a file of the same name reappears in the same
+  directory within ~15 s — exactly what the game does on launch. The real `Game.log`
+  reports a CreationTime of **May 2021**, hundreds of rotations stale. File identity
+  comes from the log's own first line (`BackupNameAttachment=…`, a millisecond session
+  start plus the archive name it will be given), with creation time as a fallback only
+  and length as a last resort. `FileIdentity::differs_from` returns
+  `Option<bool>` on purpose: collapsing "same file" and "cannot tell" into one boolean
+  is how this stayed invisible. `replacement_is_detected_even_when_the_creation_time_is_resurrected`
+  reproduces the tunneling and is the regression test.
 - **Nothing is read until the user says so.** A first run reports the trade count it
   found and offers start-from-now (the default) or import; it never imports silently.
 - **`quantityRaw` is never parsed.** The UUIDv5 name string takes every field verbatim
@@ -310,3 +320,18 @@ The game moves the previous `Game.log` into `<install>/LIVE/logbackups/` on each
 named `Game Build(<build>) <date> (<time>).log`. Rotation **preserves** rather than
 destroys, so a session missed while the client was closed is recoverable from there —
 but the directory can be pruned, which is why fixtures are committed.
+
+The archive name comes from the log's own first line, which is also what identifies the
+file to the watcher:
+
+```
+<2026-11-01T17:29:49.066Z> BackupNameAttachment=" Build(12913470) 01 Nov 26 (18 29 39)"  -- used by backup system
+```
+
+Note that the timestamp in the filename is **local time** while the line's own prefix is
+UTC — the same instant written twice, an hour apart here. Don't treat the two as
+disagreeing.
+
+Because of NTFS tunneling (see the invariants above) the filesystem's own creation time
+says nothing useful about which session a log belongs to; that first line is the only
+cheap, reliable answer.

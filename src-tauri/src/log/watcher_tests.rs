@@ -365,8 +365,7 @@ fn the_common_case_resumes_without_reprocessing() {
     let log = Log::new();
     log.append(BUY);
     let mut state = WatchState::default();
-    let created = std::fs::metadata(&log.path).unwrap().created().ok();
-    state.set_file(&log.path, created);
+    state.set_file(&log.path, tail::identity_of(&log.path));
     state.offset = log.len();
 
     assert_eq!(
@@ -380,7 +379,7 @@ fn a_shorter_file_than_our_offset_means_backfill() {
     let log = Log::new();
     log.append(BUY);
     let mut state = WatchState::default();
-    state.set_file(&log.path, std::fs::metadata(&log.path).unwrap().created().ok());
+    state.set_file(&log.path, tail::identity_of(&log.path));
     state.offset = log.len() + 1_000;
 
     assert_eq!(

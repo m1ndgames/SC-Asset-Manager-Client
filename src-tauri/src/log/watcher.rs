@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use super::correlate::{Correlator, Event};
 use super::parse::{parse_line, ParsedLine};
 use super::scan::{self, DetectedTrade, DiscardedTrade};
-use super::tail::{Tailer, Tick};
+use super::tail::{self, Tailer, Tick};
 use crate::watchstate::WatchState;
 
 /// How many raw class-matching lines to keep for Diagnostics.
@@ -98,7 +98,9 @@ pub fn plan_cold_start(
         return ColdStart::NoLog;
     }
     let len = meta.len();
-    let created = meta.created().ok();
+    // From the log's own first line, not from a creation time NTFS resurrects
+    // on every rotation. See `tail::FileIdentity`.
+    let identity = tail::identity_of(path);
 
     // Never watched anything: the offset of 0 is an absence, not a position.
     if state.log_path.is_empty() {
@@ -113,7 +115,7 @@ pub fn plan_cold_start(
             reason: BackfillReason::DifferentPath,
         };
     }
-    if !state.matches(path, created) {
+    if !state.matches(path, identity) {
         return ColdStart::Backfill {
             reason: BackfillReason::Replaced,
         };
@@ -232,8 +234,8 @@ impl Watcher {
     /// the file's length for start-from-now, or 0 to read everything.
     pub fn new(path: impl Into<PathBuf>, grace: Duration, mut state: WatchState, offset: u64) -> Self {
         let path = path.into();
-        let created = std::fs::metadata(&path).ok().and_then(|m| m.created().ok());
-        state.set_file(&path, created);
+        let identity = tail::identity_of(&path);
+        state.set_file(&path, identity.clone());
         state.offset = offset;
 
         let mut status = WatchStatus {
@@ -245,10 +247,10 @@ impl Watcher {
             last_log_timestamp: state.last_seen_log_ts.clone(),
             ..Default::default()
         };
-        status.log_present = created.is_some() || path.exists();
+        status.log_present = identity.is_some();
 
         Self {
-            tailer: Tailer::new(&path).resume_at(offset, created),
+            tailer: Tailer::new(&path).resume_at(offset, identity.unwrap_or_default()),
             correlator: Correlator::new(grace),
             state,
             safe_offset: offset,
@@ -296,11 +298,8 @@ impl Watcher {
                     self.status.rotations += 1;
                     self.safe_offset = 0;
                     self.state.reset_position();
-                    let created = std::fs::metadata(self.tailer.path())
-                        .ok()
-                        .and_then(|m| m.created().ok());
                     let path = self.tailer.path().to_path_buf();
-                    self.state.set_file(&path, created);
+                    self.state.set_file(&path, tail::identity_of(&path));
                 }
                 for line in lines {
                     self.consume(&line, now, &mut out);

@@ -215,18 +215,15 @@ fn replacement_longer_than_the_old_offset_is_still_detected() {
 
     match t.poll().unwrap() {
         Tick::Lines { lines, rotated } => {
-            // On a filesystem that reports creation time, this is caught and
-            // both lines are delivered. Where it is not reported, the tailer
-            // falls back to length and would resume mid-file — assert the
-            // behaviour we actually get rather than pretending.
-            if rotated {
-                assert_eq!(lines, vec!["a much longer first line than before", "and another"]);
-            } else {
-                assert!(
-                    !lines.is_empty(),
-                    "without creation times we still read forward, never backwards"
-                );
-            }
+            // Unconditional now that identity comes from the file's own first
+            // line. This test used to hedge on whether the filesystem reported
+            // a creation time; the hedge was hiding the fact that on NTFS the
+            // creation time is reported *and wrong*.
+            assert!(rotated);
+            assert_eq!(
+                lines,
+                vec!["a much longer first line than before", "and another"]
+            );
         }
         other => panic!("expected lines, got {other:?}"),
     }
@@ -249,6 +246,68 @@ fn deletion_then_recreation_is_handled() {
     }
 }
 
+/// The case that creation time cannot see, and the reason `FileIdentity` uses
+/// the log's first line instead.
+///
+/// NTFS *file-system tunneling*: delete a file and recreate one with the same
+/// name in the same directory within ~15 seconds, and the new file inherits
+/// the old one's creation timestamp. That is precisely what the game does on
+/// every launch, which is why the real `Game.log` reports a creation date of
+/// May 2021 — years and hundreds of rotations stale.
+///
+/// The replacement here is also deliberately *longer* than the old offset, so
+/// the `len < offset` fallback cannot rescue the detection either. With both
+/// signals defeated, only the header distinguishes the two sessions.
+#[test]
+fn replacement_is_detected_even_when_the_creation_time_is_resurrected() {
+    let log = Log::new();
+    let mut t = log.tailer();
+
+    log.append("<2026-11-01T08:07:03.350Z> BackupNameAttachment=\" (09 06 54)\"\nold-line\n");
+    assert_eq!(lines(&mut t).len(), 2);
+    let old_offset = t.offset();
+    let old_created = t.identity().unwrap().created;
+
+    log.remove();
+    // A new session, longer than our old offset.
+    log.append("<2026-11-01T17:29:49.066Z> BackupNameAttachment=\" (18 29 39)\"\n");
+    for i in 0..40 {
+        log.append(&format!("new-line-{i}\n"));
+    }
+    let new_created = std::fs::metadata(&log.path).unwrap().created().ok();
+    assert!(
+        std::fs::metadata(&log.path).unwrap().len() > old_offset,
+        "precondition: the length fallback must not be able to catch this"
+    );
+    if new_created == old_created {
+        // The real-world case, reproduced. On a filesystem that does not
+        // tunnel, the assertions below still hold — they just hold for an
+        // easier reason.
+        eprintln!("NTFS tunneling reproduced: creation time survived replacement");
+    }
+
+    match t.poll().unwrap() {
+        Tick::Lines { lines, rotated } => {
+            assert!(
+                rotated,
+                "a new session must be detected as a rotation even when its \
+                 creation time was resurrected and it is longer than the old offset"
+            );
+            assert!(
+                lines[0].contains("(18 29 39)"),
+                "reading must restart at the new session's first line, got {:?}",
+                lines.first()
+            );
+            assert_eq!(lines.len(), 41, "nothing from the new file may be skipped");
+            assert!(
+                !lines.iter().any(|l| l == "old-line"),
+                "and nothing from the old file may reappear"
+            );
+        }
+        other => panic!("expected rotated lines, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resume
 // ---------------------------------------------------------------------------
@@ -261,12 +320,12 @@ fn resuming_at_a_saved_offset_reads_nothing_twice() {
     let mut first = log.tailer();
     assert_eq!(lines(&mut first), vec!["one", "two"]);
     let saved_offset = first.offset();
-    let saved_created = first.identity().unwrap().created;
+    let saved_identity = first.identity().unwrap().clone();
 
     log.append("three\n");
 
     // A fresh process picking up where the last one stopped.
-    let mut second = log.tailer().resume_at(saved_offset, saved_created);
+    let mut second = log.tailer().resume_at(saved_offset, saved_identity);
     assert_eq!(lines(&mut second), vec!["three"]);
     assert_eq!(second.poll().unwrap(), Tick::Idle);
 }
@@ -275,10 +334,10 @@ fn resuming_at_a_saved_offset_reads_nothing_twice() {
 fn resuming_past_the_end_is_treated_as_rotation() {
     let log = Log::new();
     log.append("tiny\n");
-    let created = std::fs::metadata(&log.path).unwrap().created().ok();
+    let identity = identity_of(&log.path).unwrap();
 
     // An offset from a longer, previous session.
-    let mut t = log.tailer().resume_at(9_999, created);
+    let mut t = log.tailer().resume_at(9_999, identity);
     match t.poll().unwrap() {
         Tick::Lines { lines, rotated } => {
             assert!(rotated);

@@ -30,9 +30,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::log::tail::FileIdentity;
 use crate::error::{AppError, AppResult};
 
-pub const SCHEMA: u32 = 1;
+// Bumped to 2 when the header identity was added. A schema-1 record's offset
+// was validated against a creation time that NTFS resurrects on every
+// rotation, so it cannot be trusted; the loader drops the position and keeps
+// the id filter.
+pub const SCHEMA: u32 = 2;
 
 /// How many ids to keep. One trading session is a handful; 500 covers weeks.
 const MAX_PROCESSED_IDS: usize = 500;
@@ -44,8 +49,13 @@ pub struct WatchState {
     /// Which file the rest of this record describes. A different path makes
     /// the offset meaningless.
     pub log_path: String,
-    /// Creation time of that file, as unix milliseconds. `None` on a
-    /// filesystem that does not report one — then only length can be checked.
+    /// That file's first line — the game's own session fingerprint, and the
+    /// reliable half of the identity. Legible on purpose: you can read it and
+    /// see which session the offset belongs to.
+    #[serde(default)]
+    pub log_header: Option<String>,
+    /// Creation time as unix milliseconds. A fallback only, for a file with no
+    /// usable first line — it is not trustworthy for `Game.log`.
     pub log_created_unix_ms: Option<u64>,
     /// A line boundary in that file, past only fully-resolved detections.
     pub offset: u64,
@@ -60,6 +70,7 @@ impl Default for WatchState {
         Self {
             schema: SCHEMA,
             log_path: String::new(),
+            log_header: None,
             log_created_unix_ms: None,
             offset: 0,
             last_seen_log_ts: None,
@@ -71,15 +82,31 @@ impl Default for WatchState {
 impl WatchState {
     /// Does this record describe the file now at `path`?
     ///
-    /// A `None` creation time on either side is not a mismatch — it means the
-    /// question cannot be answered, and the caller falls back to length.
-    pub fn matches(&self, path: &Path, created: Option<SystemTime>) -> bool {
+    /// An unanswerable comparison is not a mismatch — it means the caller must
+    /// fall back to length. Note the asymmetry with creation time: it is only
+    /// consulted when neither side has a header, because NTFS tunneling makes
+    /// a *matching* creation time meaningless, while a differing one is still
+    /// conclusive.
+    pub fn matches(&self, path: &Path, identity: Option<FileIdentity>) -> bool {
         if self.log_path != path.display().to_string() {
             return false;
         }
-        match (self.log_created_unix_ms, created.map(to_unix_ms)) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
+        let Some(now) = identity else {
+            return true;
+        };
+        match now.differs_from(&self.identity()) {
+            Some(differs) => !differs,
+            None => true,
+        }
+    }
+
+    /// The stored identity, in the form the tailer compares.
+    pub fn identity(&self) -> FileIdentity {
+        FileIdentity {
+            header: self.log_header.clone(),
+            created: self
+                .log_created_unix_ms
+                .map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
         }
     }
 
@@ -114,9 +141,11 @@ impl WatchState {
         }
     }
 
-    pub fn set_file(&mut self, path: &Path, created: Option<SystemTime>) {
+    pub fn set_file(&mut self, path: &Path, identity: Option<FileIdentity>) {
         self.log_path = path.display().to_string();
-        self.log_created_unix_ms = created.map(to_unix_ms);
+        let id = identity.unwrap_or_default();
+        self.log_header = id.header;
+        self.log_created_unix_ms = id.created.map(to_unix_ms);
     }
 
     /// A different file at the same path, or a new path: the position is gone,
@@ -275,17 +304,50 @@ mod tests {
     }
 
     #[test]
-    fn identity_rejects_a_different_path_or_creation_time() {
+    fn identity_rejects_a_different_path_or_a_different_session() {
         let mut s = WatchState::default();
-        let path = Path::new("E:\\x\\Game.log");
-        let t = UNIX_EPOCH + Duration::from_millis(1_762_000_000_000);
-        s.set_file(path, Some(t));
+        let path = Path::new("E:/x/Game.log");
+        let session_a = FileIdentity {
+            header: Some("<2026-11-01T17:29:49.066Z> BackupNameAttachment=\" Build(12913470) 01 Nov 26 (18 29 39)\"".into()),
+            created: None,
+        };
+        let session_b = FileIdentity {
+            header: Some("<2026-11-01T08:07:03.350Z> BackupNameAttachment=\" Build(12913470) 01 Nov 26 (09 06 54)\"".into()),
+            created: None,
+        };
+        s.set_file(path, Some(session_a.clone()));
 
-        assert!(s.matches(path, Some(t)));
-        assert!(!s.matches(Path::new("E:\\y\\Game.log"), Some(t)));
-        assert!(!s.matches(path, Some(t + Duration::from_secs(1))));
-        // Unknown creation time: unanswerable, so not a mismatch — the caller
-        // falls back to comparing length.
+        assert!(s.matches(path, Some(session_a)));
+        assert!(!s.matches(path, Some(session_b)), "a new session must not match");
+        assert!(!s.matches(Path::new("E:/y/Game.log"), None));
+        // Nothing to compare: unanswerable, so not a mismatch — the caller
+        // falls back to length.
         assert!(s.matches(path, None));
+    }
+
+    /// The bug this identity exists for: NTFS resurrects a creation time on
+    /// rotation, so two different sessions can carry the same one. The header
+    /// must still tell them apart.
+    #[test]
+    fn a_resurrected_creation_time_does_not_make_two_sessions_match() {
+        let path = Path::new("E:/x/Game.log");
+        let tunneled = UNIX_EPOCH + Duration::from_millis(1_621_967_154_569);
+        let mut s = WatchState::default();
+        s.set_file(
+            path,
+            Some(FileIdentity {
+                header: Some("session one".into()),
+                created: Some(tunneled),
+            }),
+        );
+
+        assert!(!s.matches(
+            path,
+            Some(FileIdentity {
+                header: Some("session two".into()),
+                // Identical, because NTFS tunneling preserved it.
+                created: Some(tunneled),
+            })
+        ));
     }
 }
