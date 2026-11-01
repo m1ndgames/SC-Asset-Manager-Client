@@ -29,6 +29,7 @@ use crate::backend::firebase::FirebaseBackend;
 use crate::backend::{BackendError, SyncBackend};
 use crate::config::BackendKind;
 use crate::ids::TradeKind;
+use crate::units::CargoUnit;
 use crate::queue::ItemState;
 use crate::state::AppState;
 
@@ -38,6 +39,77 @@ pub const EV_WRITTEN: &str = "tx://written";
 pub const EV_WRITE_FAILED: &str = "tx://write-failed";
 /// Anything changed in the queue. The Review view refetches on this.
 pub const EV_QUEUE: &str = "queue://changed";
+
+/// What a completed write produced, flattened for the UI.
+///
+/// A buy and a sell write different things — one asset, versus a trade plus a
+/// mutation — but the Review view only needs to say what landed, so the two
+/// collapse to one payload rather than making the frontend switch on a tagged
+/// union it would immediately flatten anyway.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrittenSummary {
+    pub id: String,
+    pub kind: TradeKind,
+    pub item: String,
+    /// In `unit`.
+    pub amount: f64,
+    pub unit: CargoUnit,
+    /// Where the buy happened, or where the sell happened.
+    pub location: String,
+    /// One human-readable line about the side effect: what remains, what was
+    /// deleted, or that nothing matched.
+    pub detail: String,
+    /// Sell only, and non-zero means the request exceeded the holding and was
+    /// clamped. The UI must show this — it is the user's cue that their records
+    /// disagree with what they actually shipped.
+    pub over_sold_by: f64,
+}
+
+impl WrittenSummary {
+    fn from_buy(o: &crate::writer::WriteOutcome) -> Self {
+        Self {
+            id: o.asset.id.clone(),
+            kind: TradeKind::Buy,
+            item: o.asset.item.clone(),
+            amount: o.asset.amount,
+            unit: o.asset.unit.unwrap_or(CargoUnit::Scu),
+            location: o.asset.location.clone(),
+            detail: if o.would_have_merged_into.is_empty() {
+                "new asset".into()
+            } else {
+                format!(
+                    "written as a separate asset; {} existing row(s) match",
+                    o.would_have_merged_into.len()
+                )
+            },
+            over_sold_by: 0.0,
+        }
+    }
+
+    fn from_sell(o: &crate::writer::SellWriteOutcome) -> Self {
+        use crate::writer::AssetEffect;
+        let unit = o.trade.unit.unwrap_or(CargoUnit::Scu);
+        Self {
+            id: o.trade.id.clone(),
+            kind: TradeKind::Sell,
+            item: o.trade.item.clone(),
+            amount: o.trade.amount_sold,
+            unit,
+            location: o.trade.sell_location.clone(),
+            detail: match &o.asset_effect {
+                AssetEffect::Decremented { remaining } => {
+                    format!("{remaining} {} left on the asset", unit.as_str())
+                }
+                AssetEffect::Deleted => "asset sold out and removed".into(),
+                AssetEffect::Orphan => {
+                    "no matching asset; written as an orphan trade with no profit".into()
+                }
+            },
+            over_sold_by: o.over_sold_by,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,35 +176,23 @@ pub async fn drain(app: &AppHandle) -> DrainReport {
         };
         let Some(item) = claimed else { break };
 
-        // Defence in depth. `queue::approve` refuses a sell, so reaching here
-        // means a `queue.json` written before that guard existed. Fail it rather
-        // than hand it to `write_buy`, which would cheerfully write an asset
-        // saying the user owns what they sold. Failing is also the recoverable
-        // choice: the item stays, and becomes approvable once Phase 4 lands.
-        if item.detected.line.kind != TradeKind::Buy {
-            let message =
-                "The sell write path lands in Phase 4; this was left approved by an \
-                 earlier build and has not been written."
-                    .to_string();
-            let mut q = state.queue.lock().unwrap();
-            if let Err(e) = q.mark_failed(&item.id, &message) {
-                tracing::error!(error = %e, id = %item.id, "could not park the approved sell");
+        // No lock held here. Which path depends on the kind, and the two are
+        // genuinely different operations: a buy writes one asset and no trade;
+        // a sell writes a trade and *then* mutates or deletes an asset.
+        let result = match item.detected.line.kind {
+            TradeKind::Buy => crate::writer::write_buy(backend.as_ref(), &item, &refdata, &nickname)
+                .await
+                .map(|o| WrittenSummary::from_buy(&o)),
+            TradeKind::Sell => {
+                crate::writer::write_sell(backend.as_ref(), &item, &refdata, &nickname)
+                    .await
+                    .map(|o| WrittenSummary::from_sell(&o))
             }
-            report.failed += 1;
-            tracing::warn!(id = %item.id, "refused to write a sell through the buy path");
-            let _ = app.emit(
-                EV_WRITE_FAILED,
-                serde_json::json!({ "id": item.id, "message": message }),
-            );
-            continue;
-        }
-
-        // No lock held here.
-        let result = crate::writer::write_buy(backend.as_ref(), &item, &refdata, &nickname).await;
+        };
 
         let mut q = state.queue.lock().unwrap();
         match result {
-            Ok(outcome) => {
+            Ok(summary) => {
                 if let Err(e) = q.mark_written(&item.id) {
                     tracing::error!(error = %e, id = %item.id, "wrote the record but could not update the queue");
                 }
@@ -140,12 +200,13 @@ pub async fn drain(app: &AppHandle) -> DrainReport {
                 report.written_ids.push(item.id.clone());
                 tracing::info!(
                     id = %item.id,
-                    item = %outcome.asset.item,
-                    amount = outcome.asset.amount,
-                    location = %outcome.asset.location,
-                    "asset written"
+                    kind = ?item.detected.line.kind,
+                    item = %summary.item,
+                    amount = summary.amount,
+                    detail = %summary.detail,
+                    "record written"
                 );
-                let _ = app.emit(EV_WRITTEN, &outcome.asset);
+                let _ = app.emit(EV_WRITTEN, &summary);
             }
             Err(e) => {
                 let message = humanise(&e);

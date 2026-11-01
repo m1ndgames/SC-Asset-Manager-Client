@@ -236,7 +236,8 @@ async fn a_buy_writes_one_asset_and_no_trade() {
         vec![
             Call::FindAssets {
                 item: "Ammonia".into(),
-                location: "Port Tressler".into()
+                // Some(..): the buy merge rule IS location-keyed, unlike a sell.
+                location: Some("Port Tressler".into())
             },
             Call::UpsertAsset(item.id.clone()),
         ]
@@ -352,13 +353,13 @@ async fn a_failed_merge_check_does_not_block_the_write() {
 }
 
 #[tokio::test]
-async fn a_sell_is_refused_until_phase_4() {
+async fn write_buy_refuses_a_sell() {
     let (_d, item) = unapproved(SELL, "Port Tressler");
     let backend = MockBackend::new();
     let err = write_buy(&backend, &item, &refdata(), "m1nd")
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("Phase 4"), "{err}");
+    assert!(err.to_string().contains("write_sell"), "{err}");
     assert_eq!(backend.asset_count(), 0);
 }
 
@@ -392,4 +393,287 @@ async fn an_empty_id_is_refused_before_any_write() {
         .unwrap_err();
     assert!(err.to_string().contains("empty id"), "{err}");
     assert_eq!(backend.asset_count(), 0, "nothing may be written");
+}
+
+// ---------------------------------------------------------------------------
+// The sell path
+// ---------------------------------------------------------------------------
+//
+// The SELL fixture is 640 SCU at 495.5 aUEC/SCU (amount[317120] / quantity[640]).
+
+/// An asset to sell out of. `created_at` matters: it decides FIFO order.
+fn asset_of(id: &str, amount: f64, unit: CargoUnit, location: &str, created_at: &str) -> AssetRecord {
+    AssetRecord {
+        id: id.into(),
+        item: "Ammonia".into(),
+        amount,
+        unit: Some(unit),
+        buy_price: 300.0,
+        location: location.into(),
+        quality: None,
+        created_at: created_at.into(),
+        logged_by: Some("m1nd".into()),
+        source: Some("log-watcher".into()),
+        uex_buy_id: None,
+    }
+}
+
+/// §8, the rule with real consequences: **the trade is written before the
+/// asset is mutated.** Asserted on call order, which is the only way to see it.
+#[tokio::test]
+async fn a_sell_writes_the_trade_before_it_touches_the_asset() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend =
+        MockBackend::new().with_asset(asset_of("a1", 1000.0, CargoUnit::Scu, "Port Tressler", "2026-10-01T00:00:00.000Z"));
+
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+
+    let calls = backend.calls();
+    let trade_at = calls.iter().position(|c| matches!(c, Call::UpsertTrade(_)));
+    let asset_at = calls.iter().position(|c| matches!(c, Call::UpsertAsset(_)));
+    assert!(trade_at.is_some() && asset_at.is_some(), "{calls:?}");
+    assert!(
+        trade_at < asset_at,
+        "the trade must land first -- crashing between the two must leave an \
+         un-decremented asset, never vanished cargo: {calls:?}"
+    );
+    assert_eq!(out.trade.asset_id, "a1");
+}
+
+/// The case this client exists for: cargo bought at one station and sold at
+/// another. Matching on location would find nothing here and silently produce
+/// an orphan with no profit.
+#[tokio::test]
+async fn a_sell_matches_an_asset_bought_somewhere_else() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new().with_asset(asset_of(
+        "bought-at-tressler",
+        1000.0,
+        CargoUnit::Scu,
+        "Port Tressler",
+        "2026-10-01T00:00:00.000Z",
+    ));
+
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+
+    assert_eq!(out.trade.asset_id, "bought-at-tressler");
+    assert_eq!(out.trade.buy_location.as_deref(), Some("Port Tressler"));
+    assert_eq!(out.trade.sell_location, "Baijini Point");
+    // The lookup must not be narrowed by location.
+    assert!(
+        backend.calls().contains(&Call::FindAssets {
+            item: "Ammonia".into(),
+            location: None
+        }),
+        "a sell must search every location: {:?}",
+        backend.calls()
+    );
+}
+
+/// A partial sell decrements and leaves everything else alone (§8).
+#[tokio::test]
+async fn a_partial_sell_decrements_and_preserves_the_other_fields() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let mut existing = asset_of("a1", 1000.0, CargoUnit::Scu, "Port Tressler", "2026-10-01T00:00:00.000Z");
+    // Fields this client never writes, owned by the web app. They must survive.
+    existing.quality = Some(42.0);
+    existing.uex_buy_id = Some(777);
+    let created = existing.created_at.clone();
+    let backend = MockBackend::new().with_asset(existing);
+
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+
+    assert_eq!(out.asset_effect, AssetEffect::Decremented { remaining: 360.0 });
+    let after = backend.asset("a1").expect("still there");
+    assert_eq!(after.amount, 360.0, "1000 - 640");
+    assert_eq!(after.quality, Some(42.0), "the web app owns quality");
+    assert_eq!(after.uex_buy_id, Some(777), "never clobber uexBuyId");
+    assert_eq!(after.created_at, created, "a partial sell is not a new asset");
+    assert_eq!(after.buy_price, 300.0);
+    assert_eq!(backend.trade_count(), 1);
+}
+
+/// §8: delete the asset when the result is <= 0.
+#[tokio::test]
+async fn selling_the_last_of_an_asset_deletes_it() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new().with_asset(asset_of(
+        "a1", 640.0, CargoUnit::Scu, "Port Tressler", "2026-10-01T00:00:00.000Z",
+    ));
+
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+
+    assert_eq!(out.asset_effect, AssetEffect::Deleted);
+    assert!(backend.asset("a1").is_none(), "sold out, so removed");
+    assert_eq!(backend.trade_count(), 1, "the trade still stands");
+    assert!(backend.calls().contains(&Call::DeleteAsset("a1".into())));
+}
+
+/// Over-selling is clamped, never written negative (§8).
+#[tokio::test]
+async fn an_over_sell_is_clamped_and_reported() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new().with_asset(asset_of(
+        "a1", 100.0, CargoUnit::Scu, "Port Tressler", "2026-10-01T00:00:00.000Z",
+    ));
+
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+
+    assert_eq!(out.trade.amount_sold, 100.0, "clamped to what existed");
+    assert_eq!(out.over_sold_by, 540.0, "640 requested, 100 available");
+    assert_eq!(out.asset_effect, AssetEffect::Deleted);
+    assert!(
+        backend.assets().iter().all(|a| a.amount >= 0.0),
+        "never write a negative amount"
+    );
+}
+
+/// An orphan: §8 prescribes the trade's own id as `assetId`, and no buy-side
+/// fields, so the web app's Profit column honestly shows an em dash.
+#[tokio::test]
+async fn a_sell_with_no_matching_asset_is_an_orphan_trade() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new();
+
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+
+    assert_eq!(out.asset_effect, AssetEffect::Orphan);
+    assert_eq!(out.trade.asset_id, out.trade.id, "assetId is its own id");
+    assert_eq!(out.trade.buy_price, None);
+    assert_eq!(out.trade.buy_location, None);
+    assert_eq!(out.trade.buy_unit, None);
+    assert_eq!(backend.asset_count(), 0, "an orphan creates no asset");
+
+    // And the omissions must be absent from the JSON, not null.
+    let json = serde_json::to_value(&out.trade).unwrap();
+    let obj = json.as_object().unwrap();
+    for k in ["buyPrice", "buyLocation", "buyUnit", "uexSellId"] {
+        assert!(!obj.contains_key(k), "{k} must be absent: {json}");
+    }
+}
+
+/// The profit-correctness property. The web app computes
+/// `(sellPrice - buyPrice) * amountSold` with **no unit conversion**, so a
+/// trade whose `unit` and `buyUnit` disagree displays a wrong number. Writing
+/// the sell side in the asset's unit is what guarantees they agree.
+#[tokio::test]
+async fn the_trade_is_denominated_in_the_assets_unit() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    // An asset the web app wrote in cSCU, not our preferred SCU.
+    let mut existing = asset_of("a1", 100_000.0, CargoUnit::CentiScu, "Port Tressler", "2026-10-01T00:00:00.000Z");
+    existing.buy_price = 3.0; // aUEC per cSCU
+    let backend = MockBackend::new().with_asset(existing);
+
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+
+    assert_eq!(out.trade.unit, Some(CargoUnit::CentiScu));
+    assert_eq!(out.trade.buy_unit, Some(CargoUnit::CentiScu));
+    assert_eq!(
+        out.trade.unit, out.trade.buy_unit,
+        "unit and buyUnit must agree or the web app's profit is wrong"
+    );
+    // 640 SCU == 64 000 cSCU, and 495.5/SCU == 4.955/cSCU.
+    assert_eq!(out.trade.amount_sold, 64_000.0);
+    assert!((out.trade.sell_price - 4.955).abs() < 1e-9, "{}", out.trade.sell_price);
+    assert_eq!(backend.asset("a1").unwrap().amount, 36_000.0);
+}
+
+/// If the trade cannot be written, the asset must be left completely alone.
+/// This is the half of the ordering rule that a happy-path test cannot show.
+#[tokio::test]
+async fn a_failed_trade_write_leaves_the_asset_untouched() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new()
+        .with_asset(asset_of("a1", 1000.0, CargoUnit::Scu, "Port Tressler", "2026-10-01T00:00:00.000Z"))
+        .with_faults(Faults {
+            fail_all_trades: true,
+            ..Default::default()
+        });
+
+    let err = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap_err();
+
+    assert!(err.to_string().contains("trade upsert"), "{err}");
+    assert_eq!(backend.asset("a1").unwrap().amount, 1000.0, "untouched");
+    assert!(
+        !backend.calls().iter().any(|c| matches!(c, Call::UpsertAsset(_) | Call::DeleteAsset(_))),
+        "the asset must not be touched at all: {:?}",
+        backend.calls()
+    );
+}
+
+/// The reverse: the trade landed but the asset mutation failed. The write
+/// reports an error so the item is retryable, and the trade stays -- that is
+/// the discrepancy §8 deliberately prefers.
+#[tokio::test]
+async fn a_failed_asset_mutation_still_leaves_the_trade() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new()
+        .with_asset(asset_of("a1", 640.0, CargoUnit::Scu, "Port Tressler", "2026-10-01T00:00:00.000Z"))
+        .with_faults(Faults {
+            fail_delete: true,
+            ..Default::default()
+        });
+
+    let err = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap_err();
+
+    assert!(err.to_string().contains("delete"), "{err}");
+    assert_eq!(backend.trade_count(), 1, "the trade survives the failure");
+    assert_eq!(
+        backend.asset("a1").unwrap().amount,
+        640.0,
+        "un-decremented, which is the safe direction"
+    );
+}
+
+/// FIFO, and deterministic: a retry must pick the same asset, or a re-run
+/// decrements a different one.
+#[tokio::test]
+async fn the_oldest_matching_asset_is_sold_first() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new()
+        .with_asset(asset_of("newer", 1000.0, CargoUnit::Scu, "Area18", "2026-10-05T00:00:00.000Z"))
+        .with_asset(asset_of("older", 1000.0, CargoUnit::Scu, "Port Tressler", "2026-10-01T00:00:00.000Z"));
+
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+
+    assert_eq!(out.trade.asset_id, "older");
+    assert_eq!(out.other_candidates, vec!["newer".to_string()]);
+    assert_eq!(backend.asset("newer").unwrap().amount, 1000.0, "untouched");
+}
+
+/// `soldAt` comes from the log, not the clock: the item may have sat in the
+/// queue for an hour before the user reviewed it.
+#[tokio::test]
+async fn sold_at_is_the_log_timestamp() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new();
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+    assert_eq!(out.trade.sold_at, "2026-11-01T11:09:47.325Z");
+}
+
+/// The document id and the record's own `id` must agree, for trades exactly as
+/// for assets -- a mismatch is displayable but not updatable or deletable.
+#[tokio::test]
+async fn the_trade_id_is_the_queue_item_id() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new();
+    let out = write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+    assert_eq!(out.trade.id, item.id);
+    assert!(backend.calls().contains(&Call::UpsertTrade(item.id.clone())));
+}
+
+/// A sell writes no asset of its own -- only a trade, plus a mutation of one
+/// that already existed. Writing an asset here would mean recording that the
+/// user owns what they just sold.
+#[tokio::test]
+async fn a_sell_never_creates_an_asset() {
+    let (_d, item) = approved(SELL, "Baijini Point");
+    let backend = MockBackend::new();
+    write_sell(&backend, &item, &refdata(), "m1nd").await.unwrap();
+    assert_eq!(backend.asset_count(), 0);
+    assert!(
+        !backend.calls().iter().any(|c| matches!(c, Call::UpsertAsset(_))),
+        "{:?}",
+        backend.calls()
+    );
 }

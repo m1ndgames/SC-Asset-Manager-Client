@@ -529,31 +529,30 @@ fn the_view_reports_the_resolved_name_and_the_log_total() {
 // The sell guard
 // ---------------------------------------------------------------------------
 
-/// `drain` calls `write_buy` unconditionally, so an approved sell would write an
-/// *asset* record claiming the user still owns what they just sold - into the
-/// shared group database. The review card hides the approve button, but a guard
-/// that lives only in a Svelte template is not a guard; the queue owns this.
+/// Phase 4 landed, so a sell is approvable on exactly the same terms as a buy:
+/// a location, a resolvable item, sane figures. The queue does not care which
+/// kind it is — `drain` routes to `write_buy` or `write_sell`, and that routing
+/// is what used to be guarded here.
+///
+/// The property that still matters is that a sell needs a **location** like
+/// anything else. It is the sell location, and the log does not record it.
 #[test]
-fn a_sell_cannot_be_approved_while_the_sell_path_is_unbuilt() {
+fn a_sell_is_approvable_once_it_has_a_location() {
     let (_dir, mut q) = queue();
     let rd = refdata();
     let id = q.enqueue(detected(SELL)).unwrap().id.clone();
 
-    // Give it everything a buy would need, so nothing *else* can be the cause.
-    q.update(&id, located("Port Tressler")).unwrap();
+    let err = q
+        .approve(&id, &rd)
+        .expect_err("no location yet, so not approvable");
     assert!(
-        q.get(&id).unwrap().blockers(&rd).is_empty(),
-        "fixture must be otherwise ready, or this test proves nothing"
+        matches!(err, AppError::NotReady { ref blockers } if blockers.contains(&Blocker::LocationMissing)),
+        "got {err:?}"
     );
 
-    let err = q.approve(&id, &rd).expect_err("a sell must not be approvable");
-    assert!(
-        matches!(err, AppError::Queue(_)),
-        "refusal is a Queue error, not a fixable Blocker: got {err:?}"
-    );
-
-    // And it is still reviewable rather than stranded in some other state.
-    assert_eq!(q.get(&id).unwrap().state, ItemState::PendingReview);
+    q.update(&id, located("Baijini Point")).unwrap();
+    q.approve(&id, &rd).expect("a located sell approves");
+    assert_eq!(q.get(&id).unwrap().state, ItemState::Approved);
 }
 
 /// The mirror case, so the guard cannot be "fixed" by rejecting everything.

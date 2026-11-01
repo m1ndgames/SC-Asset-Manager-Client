@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 use super::value::{decode_fields, encode_fields, id_from_name};
 use super::{BackendError, BackendResult, HealthReport, Session, SyncBackend};
 use crate::config::{BackendKind, Config};
-use crate::model::AssetRecord;
+use crate::model::{AssetRecord, TradeRecord};
 
 /// Fields this client owns on an asset document.
 ///
@@ -35,6 +35,30 @@ const ASSET_FIELD_PATHS: &[&str] = &[
     "buyPrice",
     "location",
     "createdAt",
+    "loggedBy",
+    "source",
+];
+
+/// The same contract for `/trades`, and `uexSellId` is left out for the same
+/// reason `uexBuyId` is: the web app owns it, and listing it would delete the
+/// user's value on every write.
+///
+/// `buyPrice`, `buyUnit` and `buyLocation` *are* listed even though they are
+/// omitted for an orphan trade — that is the point. Listed-but-absent deletes,
+/// so an orphan cannot inherit stale buy-side values from a previous version of
+/// the same document, and the web app's Profit column correctly shows `—`.
+const TRADE_FIELD_PATHS: &[&str] = &[
+    "id",
+    "assetId",
+    "item",
+    "amountSold",
+    "unit",
+    "buyUnit",
+    "sellPrice",
+    "buyPrice",
+    "buyLocation",
+    "sellLocation",
+    "soldAt",
     "loggedBy",
     "source",
 ];
@@ -165,6 +189,65 @@ impl FirebaseBackend {
     /// The field paths this client writes, exposed for diagnostics.
     pub fn asset_field_paths() -> &'static [&'static str] {
         ASSET_FIELD_PATHS
+    }
+
+    pub fn trade_field_paths() -> &'static [&'static str] {
+        TRADE_FIELD_PATHS
+    }
+
+    /// One masked `PATCH` upsert, shared by assets and trades.
+    ///
+    /// Shared deliberately: the document id must equal the record's `id` field
+    /// for *both* collections — a mismatch yields a record the web app can
+    /// display but never update or delete — and that guard is worth having in
+    /// exactly one place rather than written out twice and drifting.
+    async fn upsert_doc<T: serde::Serialize>(
+        &self,
+        collection: &str,
+        id: &str,
+        record: &T,
+        field_paths: &[&str],
+        what: &'static str,
+    ) -> BackendResult<()> {
+        if id.trim().is_empty() {
+            return Err(BackendError::Other(format!("{what}: record has no id")));
+        }
+
+        let plain = serde_json::to_value(record).map_err(|e| BackendError::Other(e.to_string()))?;
+        let Value::Object(map) = plain else {
+            return Err(BackendError::Other(format!(
+                "{what}: record did not serialise to an object"
+            )));
+        };
+        // The id carried in the body must be the one addressing the document.
+        if map.get("id").and_then(Value::as_str) != Some(id) {
+            return Err(BackendError::Other(format!(
+                "{what}: document id {id} disagrees with the record's own id"
+            )));
+        }
+
+        let mask: String = field_paths
+            .iter()
+            .map(|f| format!("updateMask.fieldPaths={f}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let url = format!("{}/{collection}/{id}?{mask}", self.docs_root());
+
+        let token = self.token().await?;
+        let res = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&json!({ "fields": encode_fields(&map) }))
+            .send()
+            .await
+            .map_err(|e| BackendError::Network(e.to_string()))?;
+
+        if res.status().is_success() {
+            return Ok(());
+        }
+        let body: Value = res.json().await.unwrap_or(Value::Null);
+        Err(firestore_error(what, &body))
     }
 
     fn docs_root(&self) -> String {
@@ -403,45 +486,13 @@ impl SyncBackend for FirebaseBackend {
     }
 
     async fn upsert_asset(&self, asset: &AssetRecord) -> BackendResult<()> {
-        // The document id and the `id` field must be identical. A mismatch
-        // produces a record the web app can display but never update or
-        // delete, so it is guarded here rather than trusted.
-        if asset.id.trim().is_empty() {
-            return Err(BackendError::Other("asset has no id".into()));
-        }
-
-        let plain = serde_json::to_value(asset).map_err(|e| BackendError::Other(e.to_string()))?;
-        let Value::Object(map) = plain else {
-            return Err(BackendError::Other("asset did not serialise to an object".into()));
-        };
-        debug_assert_eq!(
-            map.get("id").and_then(Value::as_str),
-            Some(asset.id.as_str())
-        );
-
-        let mask: String = ASSET_FIELD_PATHS
-            .iter()
-            .map(|f| format!("updateMask.fieldPaths={f}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        let url = format!("{}/assets/{}?{mask}", self.docs_root(), asset.id);
-
-        let token = self.token().await?;
-        let res = self
-            .http
-            .patch(&url)
-            .bearer_auth(token)
-            .json(&json!({ "fields": encode_fields(&map) }))
-            .send()
+        self.upsert_doc("assets", &asset.id, asset, ASSET_FIELD_PATHS, "upsert_asset")
             .await
-            .map_err(|e| BackendError::Network(e.to_string()))?;
+    }
 
-        let status = res.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let body: Value = res.json().await.unwrap_or(Value::Null);
-        Err(firestore_error("upsert_asset", &body))
+    async fn upsert_trade(&self, trade: &TradeRecord) -> BackendResult<()> {
+        self.upsert_doc("trades", &trade.id, trade, TRADE_FIELD_PATHS, "upsert_trade")
+            .await
     }
 
     async fn get_asset(&self, id: &str) -> BackendResult<Option<AssetRecord>> {
@@ -469,12 +520,22 @@ impl SyncBackend for FirebaseBackend {
         Err(firestore_error("delete_asset", &body))
     }
 
-    async fn find_assets(&self, item: &str, location: &str) -> BackendResult<Vec<AssetRecord>> {
+    /// Fetch-all-and-filter, client side. PLAN.md risk #2: a server-side
+    /// `item == X && location == Y` query needs a Firestore composite index the
+    /// user would have to create by hand, and this client must work against an
+    /// unmodified project. The collections are small enough that it does not
+    /// matter — and the sell lookup filters on one field anyway.
+    async fn find_assets(
+        &self,
+        item: &str,
+        location: Option<&str>,
+    ) -> BackendResult<Vec<AssetRecord>> {
         let docs = self.list_collection("assets").await?;
         Ok(docs
             .iter()
             .filter_map(doc_to_asset)
-            .filter(|a| a.item == item && a.location == location)
+            .filter(|a| a.item == item)
+            .filter(|a| location.is_none_or(|loc| a.location == loc))
             .collect())
     }
 }

@@ -18,11 +18,13 @@
     approveItem,
     rejectItem,
     retryItem,
+    previewSell,
     isAppError,
     type ItemView,
     type RefData,
     type CargoUnit,
     type ItemPatch,
+    type SellPreview,
   } from "../lib/ipc";
   import { remember, suggestionFor, recentLocations } from "../lib/suggestions.svelte";
 
@@ -40,6 +42,35 @@
 
   let busy = $state(false);
   let error = $state<string | null>(null);
+
+  // What approving this sell would do. `null` means the check could not run,
+  // which is deliberately distinct from "matched nothing": one is unknown, the
+  // other is an orphan trade, and showing the wrong one would mislead.
+  let preview = $state<SellPreview | null>(null);
+  let previewing = $state(false);
+
+  // Re-checked whenever the amount or the resolved item changes, since both
+  // change which asset is hit and whether it is over-sold.
+  $effect(() => {
+    if (item.detected.kind !== "sell") return;
+    const key = `${item.id}|${item.effectiveAmountScu}|${item.resolvedItemName}|${item.edits.itemName}`;
+    let cancelled = false;
+    previewing = true;
+    previewSell(item.id)
+      .then((p) => {
+        if (!cancelled) preview = p;
+      })
+      .catch(() => {
+        if (!cancelled) preview = null;
+      })
+      .finally(() => {
+        if (!cancelled) previewing = false;
+      });
+    void key;
+    return () => {
+      cancelled = true;
+    };
+  });
 
   const isBuy = $derived(item.detected.kind === "buy");
   const shopId = $derived(item.detected.shopId);
@@ -361,12 +392,87 @@
       </span>
     </div>
 
+    <!-- A sell mutates something that already exists, so the card has to say
+         what it will hit before the user commits to it. -->
     {#if !isBuy}
-      <p class="mt-3 border-l-2 border-warn bg-warn/10 px-2 py-1 text-sm text-warn-text">
-        This is a sell. The sell path — matching the asset, writing the trade
-        first, then decrementing — lands in Phase 4, so it cannot be approved
-        yet. Nothing is lost: it stays here.
-      </p>
+      <div class="mt-3 border border-border/70 bg-bg/40 px-2 py-2">
+        <p class="font-display text-[10px] tracking-[0.2em] text-muted uppercase">
+          Sells from
+        </p>
+
+        {#if previewing}
+          <p class="mt-1 text-sm text-muted">Checking your assets…</p>
+        {:else if preview === null}
+          <p class="mt-1 text-sm text-warn-text">
+            Could not check your assets — the backend is unconfigured or
+            unreachable. You can still approve; the write does its own lookup.
+          </p>
+        {:else if preview.matchedAsset}
+          {@const a = preview.matchedAsset}
+          <p class="mt-1 text-sm text-text">
+            <span class="font-display text-accent">{qty(a.amount)}</span>
+            <span class="text-xs text-muted">{a.unit ?? "SCU"}</span>
+            bought at
+            <span class="text-accent">{price(a.buyPrice)}</span>
+            <span class="text-xs text-muted">aUEC/{a.unit ?? "SCU"}</span>
+            in <span class="text-accent">{a.location}</span>
+          </p>
+          <p class="mt-0.5 text-xs text-muted">
+            Matched on item, not location — an asset records where it was
+            <em>bought</em>, and cargo moves.
+          </p>
+
+          <p class="mt-2 text-sm text-text">
+            {#if preview.deletesAsset}
+              Sells out completely, so the asset is removed.
+            {:else}
+              Leaves
+              <span class="font-display text-accent">
+                {qty(preview.remainingAfter ?? 0)}
+              </span>
+              <span class="text-xs text-muted">{preview.unit}</span>
+            {/if}
+            {#if preview.profit !== null}
+              · profit
+              <span class="font-display text-accent">{auec(preview.profit)}</span>
+              <span class="text-xs text-muted">aUEC</span>
+            {/if}
+          </p>
+
+          {#if preview.profit !== null}
+            <p class="mt-0.5 text-xs text-muted">
+              Gross. Auto-load fees are charged by the station but never appear
+              in the log, so your realised profit is lower.
+            </p>
+          {/if}
+
+          {#if preview.overSoldBy > 0}
+            <p class="mt-2 border-l-2 border-warn bg-warn/10 px-2 py-1 text-sm text-warn-text">
+              You are selling more than this asset holds. It will be clamped to
+              {qty(preview.amountSold)}
+              {preview.unit} — {qty(preview.overSoldBy)}
+              {preview.unit} of the sale is not covered by any record. Your
+              database disagrees with what you actually shipped.
+            </p>
+          {/if}
+
+          {#if preview.otherCandidates.length}
+            <p class="mt-2 text-xs text-muted">
+              {preview.otherCandidates.length} other {item.resolvedItemName ??
+                "item"} asset{preview.otherCandidates.length === 1 ? "" : "s"} exist.
+              The oldest is sold first and the rest are untouched.
+            </p>
+          {/if}
+        {:else}
+          <p class="mt-1 text-sm text-warn-text">
+            No matching asset — this client never saw the buy.
+          </p>
+          <p class="mt-0.5 text-xs text-muted">
+            It will be written as an orphan trade: the sale is recorded, but
+            with no buy price, so the Profit column shows “—”.
+          </p>
+        {/if}
+      </div>
     {/if}
 
     {#if item.error}
@@ -393,10 +499,10 @@
         <button
           class="bg-accent px-3 py-1 font-display text-xs tracking-widest text-bg uppercase disabled:opacity-40"
           onclick={approve}
-          disabled={busy || !item.canApprove || !isBuy}
+          disabled={busy || !item.canApprove}
           title={item.canApprove ? "Write this to your database" : "Fill in what is missing first"}
         >
-          {busy ? "Writing…" : "Approve & write"}
+          {busy ? "Writing…" : isBuy ? "Approve & write" : "Approve & sell"}
         </button>
       {/if}
 
@@ -408,7 +514,7 @@
         Reject
       </button>
 
-      {#if !item.canApprove && isBuy}
+      {#if !item.canApprove}
         <span class="text-xs text-warn-text">
           {#if blocked("locationMissing")}
             Set the location to approve.

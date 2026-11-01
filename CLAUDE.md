@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phases 0-3 are done.** What exists and passes (199 tests green, clippy clean):
+**Phases 0-4 are done.** What exists and passes (214 tests green, clippy clean):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -27,8 +27,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   §8 once, backend-agnostic, tested against `backend/mock.rs`), `drain.rs` (the loop,
   the locks, the events) and the Review Queue view with the Location combobox.
 
-**Not built yet:** the sell path (Phase 4), the buy merge rule (Phase 5), PocketBase
-(Phase 6), and the History view, which is still a placeholder.
+- **The sell path:** `writer.rs` grew `write_sell` (trade first, then the asset),
+  `plan_sell` (pure, and shared with `preview_sell` so the review card cannot
+  disagree with the write), orphan trades, delete-at-zero and over-sell clamping.
+  `SyncBackend` gained `upsert_trade`, and `find_assets` now takes
+  `location: Option<&str>` — `Some` for the buy merge rule, `None` for a sell.
+  The card shows which asset is hit, what remains, and the gross profit.
+
+**Not built yet:** the buy merge rule (Phase 5), PocketBase (Phase 6), and the
+History view, which is still a placeholder.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an

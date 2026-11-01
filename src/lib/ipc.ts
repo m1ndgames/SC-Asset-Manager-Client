@@ -317,6 +317,39 @@ export interface DrainReport {
   stopped: string | null;
 }
 
+/** INTEGRATIONS.md section 4. Only the fields the card needs to show. */
+export interface AssetRecord {
+  id: string;
+  item: string;
+  amount: number;
+  unit: CargoUnit | null;
+  buyPrice: number;
+  location: string;
+  createdAt: string;
+  loggedBy?: string | null;
+}
+
+/**
+ * What approving a sell would do.
+ *
+ * Computed by the same code that performs the write, so it cannot disagree
+ * with the outcome. `null` from the command means the check could not run --
+ * no backend, or it was unreachable -- which is NOT the same as "no match".
+ */
+export interface SellPreview {
+  matchedAsset: AssetRecord | null;
+  otherCandidates: AssetRecord[];
+  amountSold: number;
+  unit: CargoUnit;
+  sellPrice: number;
+  buyPrice: number | null;
+  remainingAfter: number | null;
+  deletesAsset: boolean;
+  overSoldBy: number;
+  /** Gross: auto-load fees are not in the log. null for an orphan trade. */
+  profit: number | null;
+}
+
 /** Events the write path emits. */
 export const QEV = {
   written: "tx://written",
@@ -343,6 +376,9 @@ export const retryItem = (id: string): Promise<DrainReport> =>
   invoke("retry_item", { id });
 
 export const drainQueue = (): Promise<DrainReport> => invoke("drain_queue");
+
+export const previewSell = (id: string): Promise<SellPreview | null> =>
+  invoke("preview_sell", { id });
 
 export const getRefdata = (): Promise<RefData> => invoke("get_refdata");
 

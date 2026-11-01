@@ -21,15 +21,19 @@ use async_trait::async_trait;
 
 use super::{BackendError, BackendResult, HealthReport, Session, SyncBackend};
 use crate::config::BackendKind;
-use crate::model::AssetRecord;
+use crate::model::{AssetRecord, TradeRecord};
 
 /// Every call the writer made, in order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Call {
     UpsertAsset(String),
+    UpsertTrade(String),
     GetAsset(String),
     DeleteAsset(String),
-    FindAssets { item: String, location: String },
+    FindAssets {
+        item: String,
+        location: Option<String>,
+    },
     SignIn,
     HealthCheck,
 }
@@ -43,11 +47,18 @@ pub struct Faults {
     /// Fail every `upsert_asset`, forever.
     pub fail_all_upserts: bool,
     pub fail_find: bool,
+    /// Fail `upsert_trade`, forever. The §8 ordering case: if the trade cannot
+    /// be written the asset must be left completely untouched.
+    pub fail_all_trades: bool,
+    /// Fail `delete_asset`, forever. Models a crash *after* the trade landed,
+    /// which must leave an un-decremented asset rather than a vanished one.
+    pub fail_delete: bool,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
     assets: BTreeMap<String, AssetRecord>,
+    trades: BTreeMap<String, TradeRecord>,
     calls: Vec<Call>,
     faults: Faults,
 }
@@ -91,6 +102,18 @@ impl MockBackend {
     pub fn asset_count(&self) -> usize {
         self.inner.lock().unwrap().assets.len()
     }
+
+    pub fn trades(&self) -> Vec<TradeRecord> {
+        self.inner.lock().unwrap().trades.values().cloned().collect()
+    }
+
+    pub fn trade(&self, id: &str) -> Option<TradeRecord> {
+        self.inner.lock().unwrap().trades.get(id).cloned()
+    }
+
+    pub fn trade_count(&self) -> usize {
+        self.inner.lock().unwrap().trades.len()
+    }
 }
 
 #[async_trait]
@@ -118,7 +141,7 @@ impl SyncBackend for MockBackend {
             email: "mock@example.com".into(),
             user_id: "mock-user".into(),
             asset_count: Some(g.assets.len()),
-            trade_count: Some(0),
+            trade_count: Some(g.trades.len()),
             configured_nickname: String::new(),
             known_nicknames: Vec::new(),
             notes: Vec::new(),
@@ -143,6 +166,16 @@ impl SyncBackend for MockBackend {
         Ok(())
     }
 
+    async fn upsert_trade(&self, trade: &TradeRecord) -> BackendResult<()> {
+        let mut g = self.inner.lock().unwrap();
+        g.calls.push(Call::UpsertTrade(trade.id.clone()));
+        if g.faults.fail_all_trades {
+            return Err(BackendError::Network("mock: trade upsert always fails".into()));
+        }
+        g.trades.insert(trade.id.clone(), trade.clone());
+        Ok(())
+    }
+
     async fn get_asset(&self, id: &str) -> BackendResult<Option<AssetRecord>> {
         let mut g = self.inner.lock().unwrap();
         g.calls.push(Call::GetAsset(id.to_string()));
@@ -152,22 +185,30 @@ impl SyncBackend for MockBackend {
     async fn delete_asset(&self, id: &str) -> BackendResult<()> {
         let mut g = self.inner.lock().unwrap();
         g.calls.push(Call::DeleteAsset(id.to_string()));
+        if g.faults.fail_delete {
+            return Err(BackendError::Network("mock: delete always fails".into()));
+        }
         g.assets.remove(id);
         Ok(())
     }
 
-    async fn find_assets(&self, item: &str, location: &str) -> BackendResult<Vec<AssetRecord>> {
+    async fn find_assets(
+        &self,
+        item: &str,
+        location: Option<&str>,
+    ) -> BackendResult<Vec<AssetRecord>> {
         let mut g = self.inner.lock().unwrap();
         g.calls.push(Call::FindAssets {
             item: item.to_string(),
-            location: location.to_string(),
+            location: location.map(str::to_string),
         });
         if g.faults.fail_find {
             return Err(BackendError::Network("mock: find failed".into()));
         }
         Ok(g.assets
             .values()
-            .filter(|a| a.item == item && a.location == location)
+            .filter(|a| a.item == item)
+            .filter(|a| location.is_none_or(|loc| a.location == loc))
             .cloned()
             .collect())
     }

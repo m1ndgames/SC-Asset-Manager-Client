@@ -399,3 +399,45 @@ mod tests {
         assert!(parse_firebase_config(String::new()).is_err());
     }
 }
+
+/// What approving this sell would do, for the review card.
+///
+/// Read-only, and tolerant of being unavailable: an unconfigured or
+/// unreachable backend is not an error here, because the card must still
+/// render. The UI shows "could not check" rather than an empty match, which
+/// would wrongly imply an orphan trade.
+#[tauri::command]
+pub async fn preview_sell(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<Option<crate::writer::SellPreview>> {
+    let item = {
+        let q = state.queue.lock().unwrap();
+        q.get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::Queue(format!("{id} is not in the queue")))?
+    };
+    if item.detected.line.kind != crate::ids::TradeKind::Sell {
+        return Ok(None);
+    }
+
+    let cfg = state.config();
+    let BackendKind::Firebase = cfg.backend.kind else {
+        return Ok(None);
+    };
+    let Ok(backend) = FirebaseBackend::from_config(&cfg) else {
+        return Ok(None);
+    };
+
+    let refdata = state.refdata();
+    match crate::writer::preview_sell(&backend, &item, &refdata, &cfg.nickname).await {
+        Ok(p) => Ok(Some(p)),
+        Err(e) => {
+            // Not fatal: the user can still approve, and the write will do its
+            // own lookup. Surfacing it as an error would block review on the
+            // network being up.
+            tracing::warn!(error = %e, id = %id, "could not preview the sell");
+            Ok(None)
+        }
+    }
+}

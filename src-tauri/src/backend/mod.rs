@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::config::BackendKind;
-use crate::model::AssetRecord;
+use crate::model::{AssetRecord, TradeRecord};
 
 /// A signed-in session. Tokens live in memory only — restarting without
 /// re-prompting works because the password is in the config file.
@@ -123,6 +123,28 @@ pub trait SyncBackend: Send + Sync {
 
     async fn delete_asset(&self, id: &str) -> BackendResult<()>;
 
-    /// The §8 merge rule: assets with this exact item + location.
-    async fn find_assets(&self, item: &str, location: &str) -> BackendResult<Vec<AssetRecord>>;
+    /// Assets matching `item`, optionally narrowed to one `location`.
+    ///
+    /// The `Option` is the whole point, and the two callers want opposite
+    /// things:
+    ///
+    /// - **`Some(location)`** — the §8 *buy* merge rule, which is explicitly
+    ///   defined on "the same `item` and the same `location`".
+    /// - **`None`** — the *sell* lookup. An asset's `location` is where it was
+    ///   bought (§4) and nothing ever moves it, so matching a sell on location
+    ///   would miss on every run that buys in one place and sells in another,
+    ///   i.e. on trading. §8 never states a key for the sell side; this is our
+    ///   choice, and it is deliberately not the buy side's. See CLAUDE.md.
+    async fn find_assets(
+        &self,
+        item: &str,
+        location: Option<&str>,
+    ) -> BackendResult<Vec<AssetRecord>>;
+
+    /// Whole-document upsert keyed by the record's `id`, as `upsert_asset`.
+    ///
+    /// Separate from the asset write because §8 requires the trade to land
+    /// *first*: there is no transaction, and crashing between the two must
+    /// leave a trade whose asset was not decremented, never a vanished asset.
+    async fn upsert_trade(&self, trade: &TradeRecord) -> BackendResult<()>;
 }
