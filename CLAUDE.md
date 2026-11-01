@@ -312,6 +312,27 @@ Oct 2026) in `src-tauri/tests/fixtures/` has since contradicted it in four place
    of it. Verified single TLS stack: one `reqwest` 0.13.1, one `rustls` 0.23.46, shared
    with `tauri-plugin-updater`.
 
+5. **A sell must match its asset on `item` alone, never on `item` + `location`.**
+   PLAN.md's `find_assets(&self, item: &str, location: &str)` implies a location-keyed
+   lookup for the sell path. That is wrong, and wrong in a way that looks correct in a
+   unit test: INTEGRATIONS.md §4 defines an asset's `location` as *"Where it was
+   bought"*, and nothing ever moves it. Buying at Port Tressler and selling at Baijini
+   Point is not an edge case, it is the trading loop, so a location-keyed sell lookup
+   would match nothing on essentially every real sell, write an orphan trade, and omit
+   `buyPrice`/`buyLocation` — leaving the web app's Profit column at `—` forever. Per
+   the contract those two fields "exist only to make the profit column work", so that
+   is the whole feature silently lost.
+
+   Note that §8 does **not** settle this: it says "the asset" throughout and never
+   states a matching key for a sell. `assetId` is an *output* of the lookup, written
+   onto the trade afterwards, not an input. So this is our decision to make, not
+   something to re-read the contract for. Location *is* the right key for the buy
+   merge rule (§8 says same `item` and same `location`) — the asymmetry is the point.
+
+   Side effect: PLAN.md risk #2 (a Firestore composite index for `item == X &&
+   location == Y`) does not arise for sells, since a single-field match needs no
+   composite index.
+
 Also minor: INTEGRATIONS.md §3 says "188.9409 × 1008 = 190,452.43, which rounds to the
 logged 190,453". The product is right, the rounding claim is off by one — the logged
 `price` is a whole aUEC higher because `shopPricePerCentiSCU` is itself only logged to six
