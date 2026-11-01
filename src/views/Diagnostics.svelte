@@ -257,6 +257,36 @@
     {:else}
       <p class="text-sm text-muted">Not watching.</p>
     {/if}
+
+    <!-- An escape hatch, because the resume offset is usually right but not
+         always: a trade detected before the review queue existed, or one lost
+         to a crash, is still sitting in the log with the offset already past
+         it. PLAN.md §14 asks for this to carry its replay warning. -->
+    {#if !status?.running && plan && plan.kind !== "noLog"}
+      <details class="mt-3 border-t border-border pt-3 text-xs">
+        <summary class="cursor-pointer text-muted hover:text-text">
+          Re-read this log from the start
+        </summary>
+        <p class="mt-2 text-muted">
+          Reads the current Game.log from byte 0 and offers every trade in it
+          for review again. Trades already written or rejected are skipped —
+          history is checked by id — so the usual result is that only genuinely
+          unreviewed trades appear.
+        </p>
+        <p class="mt-1 text-warn-text">
+          It re-reads the current session's log only. Anything from an earlier
+          session has been rotated into <code>logbackups/</code> and is not
+          touched.
+        </p>
+        <button
+          class="mt-2 border border-warn px-3 py-1 font-display text-xs tracking-widest text-warn-text uppercase disabled:opacity-40"
+          onclick={() => start(0)}
+          disabled={starting}
+        >
+          {starting ? "Starting…" : "Start from byte 0"}
+        </button>
+      </details>
+    {/if}
   </Panel>
 
   {#if feed.length}
