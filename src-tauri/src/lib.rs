@@ -88,6 +88,7 @@ pub fn run() {
             commands::approve_item,
             commands::reject_item,
             commands::retry_item,
+            commands::restore_item,
             commands::drain_queue,
             commands::preview_sell,
             commands::preview_merge,

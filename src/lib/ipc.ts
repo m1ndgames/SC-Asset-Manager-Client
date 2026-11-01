@@ -388,6 +388,16 @@ export const getQueue = (): Promise<ItemView[]> => invoke("get_queue");
 export const getHistory = (limit?: number): Promise<ItemView[]> =>
   invoke("get_history", { limit });
 
+/**
+ * Put a rejected or discarded trade back into the review queue.
+ *
+ * Rust refuses a written or merged item: repeating those writes corrupts data
+ * rather than duplicating it. Expect an `AppError` of kind `queue` for those,
+ * and show its message — it says what to do instead.
+ */
+export const restoreItem = (id: string): Promise<ItemView> =>
+  invoke("restore_item", { id });
+
 export const updateItem = (id: string, patch: ItemPatch): Promise<ItemView> =>
   invoke("update_item", { id, patch });
 

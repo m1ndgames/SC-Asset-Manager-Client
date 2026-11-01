@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Current state
 
 **Phases 0-6 and 8 are done**, plus the History view and autostart. What exists
-and passes (252 tests green, clippy clean under `-D warnings`):
+and passes (259 tests green, clippy clean under `-D warnings`):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -69,8 +69,13 @@ and passes (252 tests green, clippy clean under `-D warnings`):
   on the same, matches the tag against `tauri.conf.json`, drafts, attaches
   `SHA256SUMS.txt`, then publishes.
 
-**Not built yet:** History has no retry/restore actions yet — it is read-only plus
-export. No release has been cut, so neither workflow has ever run.
+- **Restore from History:** `Queue::restore` brings a `Rejected` or `Discarded`
+  item back to `PendingReview`, keeping the user's edits. Retry was never
+  missing — `Failed` is **not** terminal, so a failed write stays in the queue
+  and `retry_item` already handles it from the Review view.
+
+**Not built yet:** nothing in the feature plan. No release has been cut, so
+neither workflow has ever run.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an
@@ -197,6 +202,28 @@ filesystem (`backend/mock.rs` stands in for the backend).
 - **A merged buy is the one non-idempotent operation in the design.** `merge_target_id`
   and `merge_applied` are written to `queue.json` *before* the backend call. A full
   rescan must warn and default to skipping merged buys.
+- **Restoring from history is the only path back out, so it refuses more than it
+  allows.** `Queue::restore` is where a write could be made to happen twice:
+  - A **`Written`** item is refused. Re-writing a sell decrements the asset a
+    second time and re-writing a merged buy adds the quantity again; neither is
+    recoverable from inside this app. A plain buy *would* be a harmless
+    idempotent upsert, but the user cannot tell those three apart from a History
+    row, so all three are refused rather than offering an action that is safe
+    only sometimes.
+  - **`merge_applied`** is refused in any state. The route that matters is not
+    the written one: a journalled merge whose backend call then failed becomes
+    `Failed`, and if the user rejects it rather than retrying it reaches history
+    as `Rejected` with the merge possibly already applied. The `Written` check
+    does not catch that; there is a test named for it.
+  - A **`Discarded`** item *is* restorable, deliberately. The game's own failure
+    line retracted it, so normally restoring is wrong — but the 3 s grace window
+    can attribute an error to the wrong detection when two trades land together,
+    and that is otherwise unrecoverable. The UI asks twice for a discard and
+    once for a rejection.
+  - Persistence order is the **reverse of `retire`**: add to the queue and fsync,
+    *then* remove from history. An item in both files is shown twice; an item in
+    neither is lost.
+
 - **Firestore document id and the record's `id` field must be identical.** A mismatch
   produces a record the web app can display but never update or delete. Guard it at
   runtime.

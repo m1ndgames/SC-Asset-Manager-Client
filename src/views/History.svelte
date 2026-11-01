@@ -18,6 +18,7 @@
   import {
     getHistory,
     exportHistoryCsv,
+    restoreItem,
     isAppError,
     QEV,
     type ItemView,
@@ -31,6 +32,42 @@
   let note = $state<string | null>(null);
   let filter = $state<"all" | "written" | "notWritten">("all");
   let query = $state("");
+
+  // Restoring. A discard came from the game's own failure line, so that one
+  // asks twice; a rejection was just the user changing their mind.
+  let restoring = $state<string | null>(null);
+  let confirmDiscard = $state<string | null>(null);
+
+  /**
+   * Whether a row can go back for review.
+   *
+   * Written and merged rows are refused in Rust too — this only decides
+   * whether to offer the button, and the real guard is `Queue::restore`.
+   */
+  function canRestore(i: ItemView): boolean {
+    if (i.mergeApplied) return false;
+    return i.state === "rejected" || i.state === "discarded";
+  }
+
+  async function restore(i: ItemView) {
+    if (i.state === "discarded" && confirmDiscard !== i.id) {
+      confirmDiscard = i.id;
+      return;
+    }
+    restoring = i.id;
+    error = null;
+    note = null;
+    try {
+      await restoreItem(i.id);
+      note = "Moved back to the Review Queue.";
+      await load();
+    } catch (e) {
+      error = isAppError(e) ? e.message : String(e);
+    } finally {
+      restoring = null;
+      confirmDiscard = null;
+    }
+  }
 
   async function load() {
     error = null;
@@ -203,7 +240,7 @@
         <table class="w-full border-collapse text-sm">
           <thead>
             <tr class="scanline border-b border-border text-left">
-              {#each ["When", "", "Item", "Amount", "aUEC/SCU", "Total", "Place", "State"] as h}
+              {#each ["When", "", "Item", "Amount", "aUEC/SCU", "Total", "Place", "State", ""] as h}
                 <th class="px-2 py-1 font-display text-[10px] tracking-[0.2em] text-muted uppercase">
                   {h}
                 </th>
@@ -244,6 +281,37 @@
                   </span>
                   {#if i.error}
                     <span class="block text-xs text-danger-text">{i.error}</span>
+                  {/if}
+                </td>
+                <td class="px-2 py-1 whitespace-nowrap text-right">
+                  {#if canRestore(i)}
+                    <button
+                      class="border px-2 py-0.5 font-display text-[10px] tracking-widest uppercase
+                             disabled:opacity-40
+                             {confirmDiscard === i.id
+                        ? 'border-warn-text text-warn-text'
+                        : 'border-border text-muted hover:text-text'}"
+                      onclick={() => restore(i)}
+                      disabled={restoring !== null}
+                      title={i.state === "discarded"
+                        ? "The game reported this trade failed. Only restore it if you are sure it actually went through."
+                        : "Put this trade back in the review queue."}
+                    >
+                      {#if restoring === i.id}
+                        Restoring…
+                      {:else if confirmDiscard === i.id}
+                        Really restore?
+                      {:else}
+                        Restore
+                      {/if}
+                    </button>
+                  {:else if i.mergeApplied}
+                    <span
+                      class="font-display text-[10px] tracking-widest text-muted uppercase"
+                      title="This buy was merged into an existing asset. That is the one write this client cannot safely repeat, so it cannot be restored — change it in SC-Asset-Manager instead."
+                    >
+                      merged
+                    </span>
                   {/if}
                 </td>
               </tr>

@@ -297,6 +297,31 @@ pub fn reject_item(state: State<'_, AppState>, id: String) -> AppResult<()> {
     q.reject(&id)
 }
 
+/// Bring a rejected or discarded trade back into the review queue.
+///
+/// Read `Queue::restore` before changing this: a written or merged item is
+/// refused there, because repeating those writes corrupts data rather than
+/// just duplicating it. This returns the restored item so the view can jump
+/// straight to it.
+#[tauri::command]
+pub fn restore_item(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<ItemView> {
+    let view = {
+        let rd = state.refdata();
+        let mut q = state.queue.lock().unwrap();
+        let item = q.restore(&id)?;
+        queue::view(item, &rd)
+    };
+    // The item has just reappeared in the review queue, so the Review view
+    // has to know even though the action happened on another screen.
+    use tauri::Emitter;
+    let _ = app.emit(crate::drain::EV_QUEUE, ());
+    Ok(view)
+}
+
 /// Retry a failed write.
 #[tauri::command]
 pub async fn retry_item(

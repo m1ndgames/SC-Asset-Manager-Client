@@ -513,6 +513,65 @@ impl Queue {
         self.get(id).ok_or_else(|| missing(id))
     }
 
+    /// Bring a retired item back into review.
+    ///
+    /// This is the one path that moves an item *out* of history, so it is also
+    /// the one place a write could be made to happen twice. Hence the refusals
+    /// below: they are not defensiveness, they are the difference between a
+    /// second write being a harmless upsert and it corrupting the user's data.
+    ///
+    /// - A **written** item stays written. Re-writing a sell would decrement
+    ///   the asset a second time, and re-writing a merged buy would add the
+    ///   quantity again; neither is recoverable from inside this app. A plain
+    ///   buy would in fact be a harmless idempotent upsert, but the user has no
+    ///   way to tell those three cases apart from the History row, so this
+    ///   refuses all of them rather than offering an action that is safe only
+    ///   sometimes.
+    /// - A **journalled merge** is refused whatever its state, because
+    ///   `merge_applied` means the non-idempotent write may already have
+    ///   landed.
+    ///
+    /// What is left is exactly the recoverable cases: a rejection the user
+    /// regrets, and a discard the grace window got wrong.
+    pub fn restore(&mut self, id: &str) -> AppResult<&QueueItem> {
+        let Some(pos) = self.history.iter().position(|i| i.id == id) else {
+            // Already back in the queue is not a failure worth an error page.
+            if self.data.items.iter().any(|i| i.id == id) {
+                return self.get(id).ok_or_else(|| missing(id));
+            }
+            return Err(missing(id));
+        };
+
+        let item = &self.history[pos];
+        if item.state == ItemState::Written {
+            return Err(AppError::Queue(format!(
+                "{id} was already written to the database. Restoring it would write it                  a second time, which for a sell means decrementing the asset twice.                  Fix it in SC-Asset-Manager instead."
+            )));
+        }
+        if item.merge_applied {
+            return Err(AppError::Queue(format!(
+                "{id} was merged into an existing asset, which is the one operation                  this client cannot repeat safely. Fix it in SC-Asset-Manager instead."
+            )));
+        }
+
+        let mut item = self.history[pos].clone();
+        item.state = ItemState::PendingReview;
+        // The reason it was discarded or rejected is no longer true of it, but
+        // the user's field edits are, so those are kept.
+        item.error = None;
+        item.updated_at = now_iso();
+
+        // The reverse of `retire`'s ordering, for the same reason: add before
+        // removing, so a crash in between leaves the item in both files and
+        // merely shows it twice, rather than in neither and losing it.
+        self.data.items.push(item);
+        self.persist()?;
+        self.history.remove(pos);
+        self.persist_history()?;
+
+        self.get(id).ok_or_else(|| missing(id))
+    }
+
     /// Record a detection that a failure line retracted, straight into history
     /// so Diagnostics and History can show it was seen and dropped.
     pub fn record_discarded(&mut self, detected: DetectedTrade, reason: String) -> AppResult<()> {

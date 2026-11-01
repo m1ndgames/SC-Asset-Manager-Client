@@ -678,3 +678,152 @@ fn the_separate_asset_opt_out_persists() {
     let reopened = Queue::open(dir.path());
     assert!(reopened.get(&id).unwrap().merge_opt_out());
 }
+
+// ---------------------------------------------------------------------------
+// Restoring from history
+// ---------------------------------------------------------------------------
+
+/// The case the feature exists for: the user rejected a trade by mistake. It
+/// comes back for review, and the edits they had already made survive.
+#[test]
+fn a_rejected_trade_can_be_restored_with_its_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.update(&id, located("Port Tressler")).unwrap();
+    q.reject(&id).unwrap();
+
+    assert!(q.get(&id).is_none(), "rejected, so out of the queue");
+    assert_eq!(q.history().len(), 1);
+
+    let restored = q.restore(&id).unwrap().clone();
+    assert_eq!(restored.state, ItemState::PendingReview);
+    assert_eq!(
+        restored.location(),
+        Some("Port Tressler"),
+        "the location the user already typed must not be thrown away"
+    );
+    assert!(restored.error.is_none());
+    assert!(q.history().is_empty(), "no longer in history");
+    assert_eq!(q.items().len(), 1, "and back in the queue exactly once");
+
+    // And it survives a restart in the new position, not the old one.
+    let reopened = Queue::open(dir.path());
+    assert_eq!(reopened.items().len(), 1);
+    assert!(reopened.history().is_empty());
+}
+
+/// A discard comes from the game's own failure line, so restoring one is
+/// normally wrong — but the 3 s grace window can attribute an error to the
+/// wrong detection when two trades land together, and that is unrecoverable
+/// otherwise. So it is allowed, and the UI is what makes it look different
+/// from restoring a rejection.
+#[test]
+fn a_discarded_trade_can_be_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Queue::open(dir.path());
+    q.record_discarded(detected(BUY), "a failure line arrived".into())
+        .unwrap();
+    let id = q.history()[0].id.clone();
+
+    let restored = q.restore(&id).unwrap();
+    assert_eq!(restored.state, ItemState::PendingReview);
+    assert!(
+        restored.error.is_none(),
+        "the discard reason no longer describes it"
+    );
+}
+
+/// The refusal that matters most. A written sell cannot be restored, because
+/// writing it again decrements the asset a second time — data loss, not a
+/// duplicate. The same action is offered for buys and sells, so it has to be
+/// refused for both rather than being safe only sometimes.
+#[test]
+fn a_written_trade_cannot_be_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(SELL)).unwrap().id.clone();
+    q.update(&id, located("Baijini Point")).unwrap();
+    q.approve(&id, &rd).unwrap();
+    q.claim_for_writing().unwrap().unwrap();
+    q.mark_written(&id).unwrap();
+
+    let err = q.restore(&id).expect_err("must refuse");
+    assert!(err.to_string().contains("already written"), "{err}");
+    assert_eq!(q.history().len(), 1, "still in history, untouched");
+    assert!(q.items().is_empty(), "and not back in the queue");
+}
+
+/// A journalled merge is refused even when it did **not** end up `Written`,
+/// which is the case the written-check cannot catch.
+///
+/// The route there is real: the merge is journalled, the backend call then
+/// fails, the item becomes `Failed`, and the user rejects it rather than
+/// retrying — so it reaches history as `Rejected` while `merge_applied` is
+/// true and the quantity may already have been added. Restoring and writing
+/// that again would add it twice.
+#[test]
+fn a_merged_buy_cannot_be_restored_even_when_it_was_not_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.update(&id, located("Port Tressler")).unwrap();
+    q.approve(&id, &rd).unwrap();
+    q.claim_for_writing().unwrap().unwrap();
+    q.mark_merging(&id, "older-asset").unwrap();
+    // The backend call fails after the journal was written.
+    q.mark_failed(&id, "connection reset").unwrap();
+    // The user gives up on it rather than retrying.
+    q.reject(&id).unwrap();
+
+    let in_history = &q.history()[0];
+    assert_eq!(in_history.state, ItemState::Rejected);
+    assert!(in_history.merge_applied, "the journal survived");
+
+    let err = q.restore(&id).expect_err("must refuse a journalled merge");
+    assert!(err.to_string().contains("merged into"), "{err}");
+    assert!(q.items().is_empty(), "and it stays out of the queue");
+}
+
+/// Restoring twice must not produce two queue entries. The second call finds
+/// it already in the queue and reports it rather than erroring, because the
+/// user double-clicking a button is not a failure.
+#[test]
+fn restoring_twice_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.reject(&id).unwrap();
+
+    q.restore(&id).unwrap();
+    let again = q.restore(&id).expect("a second restore is not an error");
+    assert_eq!(again.state, ItemState::PendingReview);
+    assert_eq!(q.items().len(), 1, "exactly one queue entry");
+    assert!(q.history().is_empty());
+}
+
+/// An id that was never seen is an error, not a silent empty restore.
+#[test]
+fn restoring_an_unknown_id_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Queue::open(dir.path());
+    assert!(q.restore("no-such-id").is_err());
+}
+
+/// A restored item is a normal queue item: it can be approved and written
+/// like any other, which is the whole point of putting it back.
+#[test]
+fn a_restored_trade_can_then_be_approved() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.reject(&id).unwrap();
+    q.restore(&id).unwrap();
+
+    q.update(&id, located("Port Tressler")).unwrap();
+    q.approve(&id, &rd).unwrap();
+    assert_eq!(q.get(&id).unwrap().state, ItemState::Approved);
+}
