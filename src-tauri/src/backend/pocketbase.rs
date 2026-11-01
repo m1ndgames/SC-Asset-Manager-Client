@@ -1,0 +1,518 @@
+//! The PocketBase backend.
+//!
+//! Schema and rules come from POCKETBASE.md in the main repo; ids and the
+//! field contract from INTEGRATIONS.md. Three things differ from Firestore in
+//! ways that are easy to get wrong by analogy:
+//!
+//! 1. **The id is split in two.** PocketBase cannot hold a hyphenated UUID as
+//!    a primary key, so a record carries `id = to_pb_id(uuid)` (hyphens
+//!    stripped, `r`-prefixed when it would otherwise start with a digit) *and*
+//!    `app_id = uuid`. Readers prefer `app_id`. `to_pb_id` is not reversible,
+//!    because the prefix is conditional — which is precisely why `app_id`
+//!    exists and why both are always written.
+//!
+//! 2. **`app_id` is the only snake_case name in the schema.** Everything else
+//!    is camelCase, exactly as Firestore: `buyPrice`, `createdAt`,
+//!    `amountSold`, `sellLocation`. PocketBase *silently discards* a field it
+//!    has no column for, so a casing slip here does not fail — it quietly
+//!    stops recording data. That is the single most dangerous property of this
+//!    backend and the reason the mapping is tested field by field.
+//!
+//! 3. **The token has no `Bearer` prefix.** INTEGRATIONS.md is explicit:
+//!    `Authorization: <token>`.
+//!
+//! There is no upsert verb, so a write is `PATCH`, falling back to `POST` on a
+//! 404. That keeps the operation idempotent on a deterministic id, which is
+//! what the whole queue design rests on.
+
+use async_trait::async_trait;
+use serde_json::{json, Map, Value};
+use std::sync::Mutex;
+
+use super::{BackendError, BackendResult, HealthReport, Session, SyncBackend};
+use crate::config::{BackendKind, Config};
+use crate::ids::to_pb_id;
+use crate::model::{AssetRecord, TradeRecord};
+
+pub const ASSETS: &str = "assets";
+pub const TRADES: &str = "trades";
+/// POCKETBASE.md §5: members are ordinary records in the `users` collection.
+const AUTH_COLLECTION: &str = "users";
+
+pub struct PocketbaseBackend {
+    http: reqwest::Client,
+    base: String,
+    email: String,
+    password: String,
+    nickname: String,
+    session: Mutex<Option<Session>>,
+}
+
+/// Hand-written for the same reason as the Firebase one: a derived `Debug`
+/// would put the password into any panic or log line that formats the struct.
+impl std::fmt::Debug for PocketbaseBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PocketbaseBackend")
+            .field("base", &self.base)
+            .field("email", &self.email)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PocketbaseBackend {
+    pub fn from_config(cfg: &Config) -> BackendResult<Self> {
+        let base = cfg.backend.pocketbase.url.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return Err(BackendError::NotConfigured(
+                "the PocketBase URL is empty".into(),
+            ));
+        }
+        if cfg.backend.email.trim().is_empty() || cfg.backend.password.is_empty() {
+            return Err(BackendError::NotConfigured(
+                "a PocketBase email and password are required".into(),
+            ));
+        }
+        Ok(Self {
+            http: reqwest::Client::new(),
+            base: base.to_string(),
+            email: cfg.backend.email.trim().to_string(),
+            password: cfg.backend.password.clone(),
+            nickname: cfg.nickname.clone(),
+            session: Mutex::new(None),
+        })
+    }
+
+    fn records_url(&self, collection: &str) -> String {
+        format!("{}/api/collections/{collection}/records", self.base)
+    }
+
+    /// A valid token, signing in again when it is close to expiring.
+    ///
+    /// PocketBase does have an `auth-refresh` endpoint, but re-authenticating
+    /// is one request either way and avoids a second code path that is only
+    /// exercised after a long idle — the kind that breaks unnoticed.
+    async fn token(&self) -> BackendResult<String> {
+        if let Some(s) = self.session.lock().unwrap().as_ref() {
+            if !s.needs_refresh() {
+                return Ok(s.token.clone());
+            }
+        }
+        let s = self.sign_in().await?;
+        let token = s.token.clone();
+        *self.session.lock().unwrap() = Some(s);
+        Ok(token)
+    }
+
+    async fn authed(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+    ) -> BackendResult<reqwest::RequestBuilder> {
+        let token = self.token().await?;
+        // No `Bearer`. INTEGRATIONS.md §1: "Send the token as
+        // `Authorization: <token>`."
+        Ok(self.http.request(method, url).header("Authorization", token))
+    }
+
+    /// `PATCH`, falling back to `POST` when the record does not exist yet.
+    ///
+    /// PocketBase has no upsert. Trying the update first means the common case
+    /// — a retry of a write that already landed — costs one request, and the
+    /// operation stays idempotent on the deterministic id.
+    async fn upsert(&self, collection: &str, fields: Map<String, Value>) -> BackendResult<()> {
+        let pb_id = fields
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError::Other("record has no PocketBase id".into()))?
+            .to_string();
+
+        let url = format!("{}/{}", self.records_url(collection), pb_id);
+        let res = self
+            .authed(reqwest::Method::PATCH, &url)
+            .await?
+            .json(&Value::Object(fields.clone()))
+            .send()
+            .await
+            .map_err(|e| BackendError::Network(e.to_string()))?;
+
+        if res.status().is_success() {
+            return Ok(());
+        }
+        if res.status() != reqwest::StatusCode::NOT_FOUND {
+            return Err(pb_error(collection, res).await);
+        }
+
+        // Not there yet: create it, id included.
+        let res = self
+            .authed(reqwest::Method::POST, &self.records_url(collection))
+            .await?
+            .json(&Value::Object(fields))
+            .send()
+            .await
+            .map_err(|e| BackendError::Network(e.to_string()))?;
+        if res.status().is_success() {
+            return Ok(());
+        }
+        Err(pb_error(collection, res).await)
+    }
+
+    /// Every record in a collection, following pagination.
+    ///
+    /// Like the Firestore backend this fetches and filters client-side where a
+    /// filter would otherwise have to be trusted; the collections are small.
+    async fn list(&self, collection: &str, filter: Option<&str>) -> BackendResult<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut page = 1;
+        loop {
+            let mut url = format!("{}?perPage=200&page={page}", self.records_url(collection));
+            if let Some(f) = filter {
+                url.push_str(&format!("&filter={}", urlencode(f)));
+            }
+            let res = self
+                .authed(reqwest::Method::GET, &url)
+                .await?
+                .send()
+                .await
+                .map_err(|e| BackendError::Network(e.to_string()))?;
+            if !res.status().is_success() {
+                return Err(pb_error(collection, res).await);
+            }
+            let body: Value = res
+                .json()
+                .await
+                .map_err(|e| BackendError::Protocol {
+                    what: collection.to_string(),
+                    detail: e.to_string(),
+                })?;
+            let items = body
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            out.extend(items);
+
+            let total_pages = body.get("totalPages").and_then(Value::as_i64).unwrap_or(1);
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+}
+
+/// Percent-encode a PocketBase filter expression for a query string.
+///
+/// Deliberately conservative — anything not unreserved is escaped — because a
+/// filter contains quotes, parentheses, `=` and spaces, and a half-escaped one
+/// silently matches the wrong rows rather than erroring.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Escape a value for embedding in a PocketBase filter string literal.
+fn filter_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Columns that POCKETBASE.md says were added after the first release, and so
+/// may be missing on an instance that was set up early.
+///
+/// This matters because PocketBase answers a write containing an unknown field
+/// with 200 and silently drops the field. Losing `unit` is not cosmetic: an
+/// asset whose unit is unknown cannot be merged or sold against correctly.
+const LATE_ASSET_COLUMNS: &[&str] = &["unit", "quality", "source"];
+const LATE_TRADE_COLUMNS: &[&str] = &["unit", "buyUnit", "source"];
+
+/// Detect a missing column from a returned record.
+///
+/// PocketBase returns *every* column of a record, including the ones that are
+/// unset — an empty Text comes back as `""`, an unset Number as `0`. So a key
+/// that is absent from a record means the collection has no such column, which
+/// is the only cheap way to see this without an admin token.
+///
+/// It needs at least one existing record to look at; with an empty collection
+/// there is nothing to infer from, and it reports nothing rather than guessing.
+fn missing_columns(rows: &[Value], expected: &[&str]) -> Vec<String> {
+    let Some(obj) = rows.first().and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    expected
+        .iter()
+        .filter(|c| !obj.contains_key(**c))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+async fn pb_error(what: &str, res: reqwest::Response) -> BackendError {
+    let status = res.status();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("no message")
+        .to_string();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return BackendError::Auth(format!("{what}: {message}"));
+    }
+    BackendError::Protocol {
+        what: what.to_string(),
+        detail: format!("HTTP {status}: {message}"),
+    }
+}
+
+/// Turn a record into the PocketBase body: the app's `id` becomes `app_id`,
+/// and `id` becomes the mangled primary key.
+///
+/// Both are always written. §6: "Always write both fields."
+fn to_pb_fields<T: serde::Serialize>(record: &T, app_id: &str) -> BackendResult<Map<String, Value>> {
+    let Value::Object(mut map) = serde_json::to_value(record)
+        .map_err(|e| BackendError::Other(e.to_string()))?
+    else {
+        return Err(BackendError::Other("record is not an object".into()));
+    };
+
+    let uuid = uuid::Uuid::parse_str(app_id).map_err(|_| {
+        BackendError::Other(format!("{app_id} is not a uuid, so it has no PocketBase id"))
+    })?;
+    map.remove("id");
+    map.insert("app_id".into(), json!(app_id));
+    map.insert("id".into(), json!(to_pb_id(&uuid)));
+    Ok(map)
+}
+
+/// The reverse: prefer `app_id` over the PocketBase primary key, because
+/// `to_pb_id` cannot be inverted.
+fn asset_from_pb(v: &Value) -> Option<AssetRecord> {
+    let obj = v.as_object()?;
+    let mut m = obj.clone();
+    let app_id = m.get("app_id").and_then(Value::as_str)?.to_string();
+    m.insert("id".into(), json!(app_id));
+    m.remove("app_id");
+    // PocketBase returns "" for an unset optional Text column, and 0 for an
+    // unset Number. An absent `unit` must stay absent rather than becoming an
+    // empty string that fails to parse as a CargoUnit.
+    if m.get("unit").and_then(Value::as_str) == Some("") {
+        m.remove("unit");
+    }
+    serde_json::from_value(Value::Object(m)).ok()
+}
+
+#[async_trait]
+impl SyncBackend for PocketbaseBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Pocketbase
+    }
+
+    async fn sign_in(&self) -> BackendResult<Session> {
+        let url = format!(
+            "{}/api/collections/{AUTH_COLLECTION}/auth-with-password",
+            self.base
+        );
+        let res = self
+            .http
+            .post(&url)
+            .json(&json!({ "identity": self.email, "password": self.password }))
+            .send()
+            .await
+            .map_err(|e| BackendError::Network(e.to_string()))?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let body: Value = res.json().await.unwrap_or(Value::Null);
+            let msg = body
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("sign-in failed");
+            return Err(BackendError::Auth(format!("{msg} (HTTP {status})")));
+        }
+
+        let body: Value = res.json().await.map_err(|e| BackendError::Protocol {
+            what: "auth-with-password".into(),
+            detail: e.to_string(),
+        })?;
+        let token = body
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError::Protocol {
+                what: "auth-with-password".into(),
+                detail: "no token in the response".into(),
+            })?
+            .to_string();
+        let user_id = body
+            .get("record")
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        Ok(Session {
+            token,
+            // PocketBase issues no refresh token; re-authenticating is one
+            // request, so there is nothing to hold here.
+            refresh_token: String::new(),
+            // Its tokens are long-lived, but a conservative window costs one
+            // cheap sign-in and avoids reasoning about the JWT's clock.
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(50),
+            user_id,
+        })
+    }
+
+    async fn health_check(&self) -> BackendResult<HealthReport> {
+        let mut notes = Vec::new();
+        let session = self.sign_in().await?;
+        *self.session.lock().unwrap() = Some(session.clone());
+
+        let assets = self.list(ASSETS, None).await;
+        let trades = self.list(TRADES, None).await;
+
+        let asset_count = match &assets {
+            Ok(v) => Some(v.len()),
+            Err(e) => {
+                notes.push(format!("could not read assets: {e}"));
+                None
+            }
+        };
+        let trade_count = match &trades {
+            Ok(v) => Some(v.len()),
+            Err(e) => {
+                notes.push(format!("could not read trades: {e}"));
+                None
+            }
+        };
+
+        // A missing column is the one way this backend loses data without
+        // reporting an error, so it is surfaced here rather than discovered
+        // later as an asset with no unit.
+        for (rows, expected, what) in [
+            (assets.as_ref().ok(), LATE_ASSET_COLUMNS, ASSETS),
+            (trades.as_ref().ok(), LATE_TRADE_COLUMNS, TRADES),
+        ] {
+            let Some(rows) = rows else { continue };
+            let missing = missing_columns(rows, expected);
+            if !missing.is_empty() {
+                notes.push(format!(
+                    "the `{what}` collection has no {} column{} -- PocketBase accepts a write                      containing an unknown field and silently discards it, so add {} before                      writing anything",
+                    missing.join(", no "),
+                    if missing.len() == 1 { "" } else { "s" },
+                    if missing.len() == 1 { "it" } else { "them" },
+                ));
+            }
+        }
+
+        let mut known_nicknames: Vec<String> = assets
+            .iter()
+            .flatten()
+            .chain(trades.iter().flatten())
+            .filter_map(|v| v.get("loggedBy").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        known_nicknames.sort();
+        known_nicknames.dedup();
+
+        Ok(HealthReport {
+            ok: asset_count.is_some() && trade_count.is_some(),
+            backend: BackendKind::Pocketbase,
+            email: self.email.clone(),
+            user_id: session.user_id,
+            asset_count,
+            trade_count,
+            configured_nickname: self.nickname.clone(),
+            known_nicknames,
+            notes,
+        })
+    }
+
+    async fn upsert_asset(&self, asset: &AssetRecord) -> BackendResult<()> {
+        if asset.id.trim().is_empty() {
+            return Err(BackendError::Other("asset has no id".into()));
+        }
+        let fields = to_pb_fields(asset, &asset.id)?;
+        self.upsert(ASSETS, fields).await
+    }
+
+    async fn upsert_trade(&self, trade: &TradeRecord) -> BackendResult<()> {
+        if trade.id.trim().is_empty() {
+            return Err(BackendError::Other("trade has no id".into()));
+        }
+        let fields = to_pb_fields(trade, &trade.id)?;
+        self.upsert(TRADES, fields).await
+    }
+
+    async fn get_asset(&self, id: &str) -> BackendResult<Option<AssetRecord>> {
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            return Ok(None);
+        };
+        let url = format!("{}/{}", self.records_url(ASSETS), to_pb_id(&uuid));
+        let res = self
+            .authed(reqwest::Method::GET, &url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| BackendError::Network(e.to_string()))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            return Err(pb_error(ASSETS, res).await);
+        }
+        let body: Value = res.json().await.map_err(|e| BackendError::Protocol {
+            what: ASSETS.into(),
+            detail: e.to_string(),
+        })?;
+        Ok(asset_from_pb(&body))
+    }
+
+    async fn delete_asset(&self, id: &str) -> BackendResult<()> {
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            return Err(BackendError::Other(format!("{id} is not a uuid")));
+        };
+        let url = format!("{}/{}", self.records_url(ASSETS), to_pb_id(&uuid));
+        let res = self
+            .authed(reqwest::Method::DELETE, &url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| BackendError::Network(e.to_string()))?;
+        if res.status().is_success() || res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        Err(pb_error(ASSETS, res).await)
+    }
+
+    async fn find_assets(
+        &self,
+        item: &str,
+        location: Option<&str>,
+    ) -> BackendResult<Vec<AssetRecord>> {
+        let mut filter = format!("item={}", filter_literal(item));
+        if let Some(loc) = location {
+            filter.push_str(&format!(" && location={}", filter_literal(loc)));
+        }
+        let rows = self.list(ASSETS, Some(&filter)).await?;
+        // Filtered again locally: the server-side filter is the optimisation,
+        // the local one is the guarantee. A filter syntax change would
+        // otherwise return everything and look like a correct merge target.
+        Ok(rows
+            .iter()
+            .filter_map(asset_from_pb)
+            .filter(|a| a.item == item)
+            .filter(|a| location.is_none_or(|loc| a.location == loc))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+#[path = "pocketbase_tests.rs"]
+mod tests;

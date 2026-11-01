@@ -212,8 +212,14 @@
             bind:value={cfg.pocketbase.url}
             placeholder="https://pb.example.org"
           />
+          <p class="mt-1 text-xs text-muted">
+            The base URL of your instance, without a trailing path. Sign in with an
+            ordinary member account — never an admin token.
+          </p>
           <p class="mt-1 text-xs text-warn-text">
-            PocketBase support is not built yet — it lands in Phase 6.
+            Untested against a live instance. The code follows the documented schema, but
+            PocketBase accepts a write containing an unknown field and discards it without
+            an error — so run <strong>Test connection</strong> first and read its notes.
           </p>
         </div>
       {/if}

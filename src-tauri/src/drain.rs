@@ -25,9 +25,7 @@
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::backend::firebase::FirebaseBackend;
 use crate::backend::{BackendError, SyncBackend};
-use crate::config::BackendKind;
 use crate::ids::TradeKind;
 use crate::units::CargoUnit;
 use crate::queue::ItemState;
@@ -142,17 +140,11 @@ pub async fn drain(app: &AppHandle) -> DrainReport {
     }
 
     let cfg = state.config();
-    let backend: Box<dyn SyncBackend> = match cfg.backend.kind {
-        BackendKind::Firebase => match FirebaseBackend::from_config(&cfg) {
-            Ok(b) => Box::new(b),
-            Err(e) => {
-                report.stopped = Some(e.to_string());
-                tracing::warn!(error = %e, "approved items are waiting but the backend is not usable");
-                return report;
-            }
-        },
-        BackendKind::Pocketbase => {
-            report.stopped = Some("PocketBase support lands in Phase 6".into());
+    let backend: Box<dyn SyncBackend> = match crate::backend::open(&cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            report.stopped = Some(e.to_string());
+            tracing::warn!(error = %e, "approved items are waiting but the backend is not usable");
             return report;
         }
     };

@@ -10,12 +10,13 @@
 
 pub mod firebase;
 pub mod mock;
+pub mod pocketbase;
 pub mod value;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::config::BackendKind;
+use crate::config::{BackendKind, Config};
 use crate::model::{AssetRecord, TradeRecord};
 
 /// A signed-in session. Tokens live in memory only — restarting without
@@ -34,6 +35,18 @@ impl Session {
     /// Refresh if expiring within a five-minute skew.
     pub fn needs_refresh(&self) -> bool {
         self.expires_at - chrono::Utc::now() < chrono::Duration::minutes(5)
+    }
+}
+
+/// The one place a backend is chosen from config.
+///
+/// Every caller goes through this rather than matching on `BackendKind`
+/// itself, so adding a third backend cannot leave a stale arm behind that
+/// silently refuses to write.
+pub fn open(cfg: &Config) -> BackendResult<Box<dyn SyncBackend>> {
+    match cfg.backend.kind {
+        BackendKind::Firebase => Ok(Box::new(firebase::FirebaseBackend::from_config(cfg)?)),
+        BackendKind::Pocketbase => Ok(Box::new(pocketbase::PocketbaseBackend::from_config(cfg)?)),
     }
 }
 

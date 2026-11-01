@@ -5,9 +5,8 @@ use std::path::PathBuf;
 
 use tauri::State;
 
-use crate::backend::firebase::FirebaseBackend;
-use crate::backend::{BackendError, HealthReport, SyncBackend};
-use crate::config::{self, BackendKind, ConfigDto, ConfigPatch, FirebaseConfig};
+use crate::backend::{BackendError, HealthReport};
+use crate::config::{self, ConfigDto, ConfigPatch, FirebaseConfig};
 use crate::error::{AppError, AppResult};
 use crate::drain;
 use crate::log::watcher::{self, ColdStart, WatchStatus};
@@ -130,15 +129,7 @@ pub fn parse_firebase_config(text: String) -> AppResult<FirebaseConfig> {
 #[tauri::command]
 pub async fn test_backend(state: State<'_, AppState>) -> Result<HealthReport, BackendError> {
     let cfg = state.config();
-    match cfg.backend.kind {
-        BackendKind::Firebase => {
-            let b = FirebaseBackend::from_config(&cfg)?;
-            b.health_check().await
-        }
-        BackendKind::Pocketbase => Err(BackendError::NotConfigured(
-            "PocketBase support is not built yet — it lands in Phase 6".into(),
-        )),
-    }
+    crate::backend::open(&cfg)?.health_check().await
 }
 
 // ---------------------------------------------------------------------------
@@ -461,15 +452,14 @@ pub async fn preview_sell(
     }
 
     let cfg = state.config();
-    let BackendKind::Firebase = cfg.backend.kind else {
-        return Ok(None);
-    };
-    let Ok(backend) = FirebaseBackend::from_config(&cfg) else {
+    // A preview is best-effort: an unusable backend means no preview, not an
+    // error on a screen the user is only reading.
+    let Ok(backend) = crate::backend::open(&cfg) else {
         return Ok(None);
     };
 
     let refdata = state.refdata();
-    match crate::writer::preview_sell(&backend, &item, &refdata, &cfg.nickname).await {
+    match crate::writer::preview_sell(backend.as_ref(), &item, &refdata, &cfg.nickname).await {
         Ok(p) => Ok(Some(p)),
         Err(e) => {
             // Not fatal: the user can still approve, and the write will do its
@@ -582,10 +572,9 @@ pub async fn preview_merge(
     }
 
     let cfg = state.config();
-    let BackendKind::Firebase = cfg.backend.kind else {
-        return Ok(None);
-    };
-    let Ok(backend) = FirebaseBackend::from_config(&cfg) else {
+    // A preview is best-effort: an unusable backend means no preview, not an
+    // error on a screen the user is only reading.
+    let Ok(backend) = crate::backend::open(&cfg) else {
         return Ok(None);
     };
 
@@ -593,7 +582,7 @@ pub async fn preview_merge(
     let Ok(asset) = crate::writer::build_asset(&item, &refdata, &cfg.nickname) else {
         return Ok(None);
     };
-    match crate::writer::plan_merge(&backend, &asset).await {
+    match crate::writer::plan_merge(backend.as_ref(), &asset).await {
         Ok(p) => Ok(p),
         Err(e) => {
             tracing::warn!(error = %e, id = %id, "could not preview the merge");

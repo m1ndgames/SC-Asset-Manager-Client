@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phases 0-5 are done**, plus the History view and autostart. What exists and
-passes (231 tests green, clippy clean):
+**Phases 0-6 are done**, plus the History view and autostart. What exists and
+passes (248 tests green, clippy clean):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -57,8 +57,13 @@ passes (231 tests green, clippy clean):
   checked against the plan before applying, so a concurrent change is refused
   rather than overwritten. `edits.separate_asset` is the opt-out.
 
-**Not built yet:** PocketBase (Phase 6) and packaging (Phase 8). History has no
-retry/restore actions yet — it is read-only plus export.
+- **PocketBase:** `backend/pocketbase.rs`, a second `SyncBackend`. `backend::open`
+  is now the only place a backend is chosen from config, so a third one cannot
+  leave a stale `match` arm behind that silently refuses to write.
+  **Unverified on the wire** — see below.
+
+**Not built yet:** packaging (Phase 8). History has no retry/restore actions
+yet — it is read-only plus export.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an
@@ -434,6 +439,42 @@ stays absent rather than becoming 0, and a repeated `upsert_asset` is idempotent
 
 Re-run with `cargo test --test live_backend -- --ignored --nocapture`. It writes to the
 configured project, so it is `#[ignore]`d.
+
+## PocketBase, and why its tests look the way they do
+
+Written against `POCKETBASE.md` + INTEGRATIONS.md with **no instance available to
+test against**, so treat the wire behaviour as unverified: the auth handshake,
+PATCH-then-POST, the filter syntax and pagination have never run.
+`tests/live_pocketbase.rs` is the check that settles it (`cargo test --test
+live_pocketbase -- --ignored --nocapture`); a failure there is the expected first
+outcome, not a surprise. The two most likely to be wrong are whether PocketBase
+accepts `Authorization: <token>` with no `Bearer` prefix, and whether it accepts
+a client-supplied `id` on create.
+
+What *is* tested is the naming, and that is deliberate:
+
+- **PocketBase answers a write containing an unknown field with 200 and silently
+  discards the field.** A casing slip does not fail — it writes a record with the
+  field missing. So the unit tests assert the emitted key set against the
+  documented schema column by column, in both directions: one test catches a typo
+  that invents a column, another catches a rename that loses a real one. There is
+  no other way to see this class of bug.
+- **`app_id` is the only snake_case name in the schema.** Everything else is
+  camelCase exactly as Firestore. Writing `appId` would be discarded and leave
+  every record unfindable by the web app.
+- **The id is split in two.** A record carries `id = to_pb_id(uuid)` (hyphens
+  stripped, `r`-prefixed when it would otherwise start with a digit — which both
+  published vectors do) *and* `app_id = uuid`. `to_pb_id` is not reversible
+  because the prefix is conditional, so `app_id` is the only way back; both are
+  always written and a read prefers `app_id`.
+- **A missing column is detectable, and `health_check` reports it.** PocketBase
+  returns *every* column of a record including unset ones (`""` for Text, `0` for
+  Number), so a key absent from a returned record means the collection has no such
+  column. `unit`, `quality`, `buyUnit` and `source` were added after the first
+  release and may be missing on an early instance; losing `unit` is not cosmetic,
+  since an asset of unknown unit cannot be merged or sold against. It needs one
+  existing record to infer from and reports nothing on an empty collection rather
+  than warning falsely.
 
 ## Log rotation
 
