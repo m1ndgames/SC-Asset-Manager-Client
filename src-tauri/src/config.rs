@@ -89,6 +89,13 @@ pub struct Config {
     pub log_path: String,
     pub poll_interval_ms: u64,
     pub grace_window_ms: i64,
+    /// Start watching as soon as the app opens.
+    ///
+    /// Additive with a serde default rather than a schema bump: an existing
+    /// `config.toml` has no such key and must keep loading, and `false` is the
+    /// behaviour it had.
+    #[serde(default)]
+    pub autostart_watcher: bool,
     pub backend: BackendConfig,
 }
 
@@ -101,6 +108,9 @@ impl Default for Config {
             log_path: String::new(),
             poll_interval_ms: 1000,
             grace_window_ms: crate::log::scan::DEFAULT_HOLD_MS,
+            // Off by default. Watching is cheap, but starting it is the user's
+            // decision to make once rather than one this client assumes.
+            autostart_watcher: false,
             backend: BackendConfig::default(),
         }
     }
@@ -125,6 +135,7 @@ impl Config {
             log_path: self.log_path.clone(),
             poll_interval_ms: self.poll_interval_ms,
             grace_window_ms: self.grace_window_ms,
+            autostart_watcher: self.autostart_watcher,
             backend_kind: self.backend.kind,
             email: self.backend.email.clone(),
             password_set: !self.backend.password.is_empty(),
@@ -156,6 +167,7 @@ pub struct ConfigDto {
     pub log_path: String,
     pub poll_interval_ms: u64,
     pub grace_window_ms: i64,
+    pub autostart_watcher: bool,
     pub backend_kind: BackendKind,
     pub email: String,
     /// True when a password is stored. The password itself never crosses here.
@@ -171,7 +183,7 @@ pub struct ConfigDto {
 /// What the frontend may change. `password: None` means "leave the stored one
 /// alone", which is how the UI can save other fields without ever holding the
 /// secret.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigPatch {
     pub nickname: Option<String>,
@@ -179,6 +191,7 @@ pub struct ConfigPatch {
     pub log_path: Option<String>,
     pub poll_interval_ms: Option<u64>,
     pub grace_window_ms: Option<i64>,
+    pub autostart_watcher: Option<bool>,
     pub backend_kind: Option<BackendKind>,
     pub email: Option<String>,
     pub password: Option<String>,
@@ -202,6 +215,9 @@ impl Config {
         }
         if let Some(v) = p.grace_window_ms {
             self.grace_window_ms = v.clamp(0, 60_000);
+        }
+        if let Some(v) = p.autostart_watcher {
+            self.autostart_watcher = v;
         }
         if let Some(v) = p.backend_kind {
             self.backend.kind = v;
@@ -361,6 +377,7 @@ mod tests {
         let mut c = filled();
         c.apply(ConfigPatch {
             nickname: Some("other".into()),
+            autostart_watcher: None,
             app_url: None,
             log_path: None,
             poll_interval_ms: None,
@@ -380,6 +397,7 @@ mod tests {
         let mut c = Config::default();
         c.apply(ConfigPatch {
             nickname: Some("  m1nd  ".into()),
+            autostart_watcher: None,
             app_url: Some("https://example.org/".into()),
             log_path: None,
             poll_interval_ms: Some(1),
@@ -436,5 +454,58 @@ mod tests {
         fn email_for_test(&self) -> &str {
             &self.backend.email
         }
+    }
+
+    /// Additive, so a `config.toml` written before autostart existed must still
+    /// load — and must come back off, which is the behaviour it had.
+    #[test]
+    fn autostart_defaults_to_off_for_an_existing_config_file() {
+        let without = r#"
+schema = 1
+nickname = "m1nd"
+app_url = "https://sc-assetmanager.org"
+log_path = ""
+poll_interval_ms = 1000
+grace_window_ms = 3000
+
+[backend]
+kind = "firebase"
+email = ""
+password = ""
+"#;
+        let cfg: Config = toml::from_str(without).expect("an older config must still parse");
+        assert!(
+            !cfg.autostart_watcher,
+            "absent must mean off, never on: enabling a background reader by \
+             upgrading would be a surprise"
+        );
+    }
+
+    #[test]
+    fn autostart_round_trips_and_is_patchable() {
+        let mut cfg = filled();
+        assert!(!cfg.autostart_watcher);
+
+        cfg.apply(ConfigPatch {
+            autostart_watcher: Some(true),
+            ..Default::default()
+        });
+        assert!(cfg.autostart_watcher);
+        assert!(cfg.to_dto().autostart_watcher, "the UI reads it back");
+
+        let round: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(round.autostart_watcher);
+
+        // A patch that does not mention it leaves it alone, like every other
+        // field — the Settings form saves one thing at a time.
+        round_trip_keeps_autostart(round);
+    }
+
+    fn round_trip_keeps_autostart(mut cfg: Config) {
+        cfg.apply(ConfigPatch {
+            nickname: Some("someone-else".into()),
+            ..Default::default()
+        });
+        assert!(cfg.autostart_watcher, "an unrelated patch must not clear it");
     }
 }

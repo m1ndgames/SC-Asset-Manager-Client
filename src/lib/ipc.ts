@@ -117,6 +117,7 @@ export interface ConfigDto {
   logPath: string;
   pollIntervalMs: number;
   graceWindowMs: number;
+  autostartWatcher: boolean;
   backendKind: BackendKind;
   email: string;
   passwordSet: boolean;
@@ -133,6 +134,7 @@ export interface ConfigPatch {
   logPath?: string;
   pollIntervalMs?: number;
   graceWindowMs?: number;
+  autostartWatcher?: boolean;
   backendKind?: BackendKind;
   email?: string;
   password?: string;

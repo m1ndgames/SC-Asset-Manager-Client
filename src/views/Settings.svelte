@@ -55,6 +55,7 @@
         logPath: cfg.logPath,
         pollIntervalMs: cfg.pollIntervalMs,
         graceWindowMs: cfg.graceWindowMs,
+        autostartWatcher: cfg.autostartWatcher,
         backendKind: cfg.backendKind,
         email: cfg.email,
         // Only send a password when one was typed.
@@ -342,6 +343,24 @@
           </p>
         </div>
       </div>
+
+      <label class="mt-4 flex cursor-pointer items-start gap-2">
+        <input
+          type="checkbox"
+          class="mt-0.5 accent-accent"
+          bind:checked={cfg.autostartWatcher}
+        />
+        <span>
+          <span class="text-sm text-text">Start watching when the app opens</span>
+          <span class="mt-0.5 block text-xs text-muted">
+            Saves a click. It cannot import anything behind your back: on a log
+            this client has not seen before it starts from the end, exactly as
+            the manual start does, so only trades you make from then on appear.
+            Reading an existing log from the beginning stays a deliberate
+            choice in Diagnostics.
+          </span>
+        </span>
+      </label>
     </Panel>
 
     <div class="flex items-center gap-3">

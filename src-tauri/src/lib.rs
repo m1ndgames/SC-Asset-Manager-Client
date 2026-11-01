@@ -130,6 +130,36 @@ pub fn run() {
                         ),
                     }
                 }
+
+                // Autostart, last: reference data first means the trades it
+                // finds can resolve their item names straight away.
+                //
+                // This delegates to the same `start_watcher` the button calls,
+                // with no offset, which is what keeps the "nothing is read
+                // until the user says so" invariant intact — that path defaults
+                // a first run to start-from-now and never backfills silently.
+                // Enabling autostart therefore cannot import history behind the
+                // user's back; it only removes the click.
+                {
+                    use tauri::Manager;
+                    let state = handle.state::<state::AppState>();
+                    if state.config().autostart_watcher {
+                        match commands::start_watcher(handle.clone(), state, None) {
+                            Ok(s) => tracing::info!(
+                                path = %s.path,
+                                offset = s.safe_offset,
+                                "watcher autostarted"
+                            ),
+                            // Never fatal. A missing log or a bad path must not
+                            // stop the app opening — the user needs Settings to
+                            // fix exactly that.
+                            Err(e) => tracing::warn!(
+                                error = ?e,
+                                "autostart is on but the watcher could not start"
+                            ),
+                        }
+                    }
+                }
             });
             Ok(())
         })
