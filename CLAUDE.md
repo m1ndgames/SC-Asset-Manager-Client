@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
   `pubkey` wired in.
 - The pure core: `ids.rs`, `units.rs`, `log/parse.rs`, `log/scan.rs`, `log/discover.rs`,
-  including both published UUIDv5 vectors and a corpus suite over 11 real sessions.
+  including both published UUIDv5 vectors and a corpus suite over 12 real sessions.
 - `config.rs` (password never crosses into the webview), `backend/firebase.rs` +
   `backend/value.rs`, `probe.rs`, and a working Settings view. Firestore PATCH
   semantics settled against a real project — see below.
@@ -185,8 +185,8 @@ sell lists one group per box size.
 This matters: reading only one `boxSize`/`unitAmount` pair — which is what a naive
 `field[value]` map gives you, since later keys overwrite earlier ones — makes parity
 appear to fail on ~11% of sells. PLAN.md §3.5 and an earlier draft of this file both got
-this wrong. Summed, it holds on **90 of 91** real trade lines (21/21 buys, 21/21
-`Location` sells, 48/49 `ResourceContainer` sells), so it is a sound signal worth
+this wrong. Summed, it holds on **91 of 92** real trade lines (22/22 buys, 21/21
+`Location` sells, 49/50 `ResourceContainer` sells), so it is a sound signal worth
 surfacing. `log/parse.rs` keeps `box_groups` as an ordered `Vec` for exactly this reason.
 
 A mismatch sets a warning flag on the review card — it does **not** reject the trade, and
@@ -194,8 +194,8 @@ A mismatch sets a warning flag on the review card — it does **not** reject the
 
 Two further drift detectors that do not depend on cargo box data at all:
 - the buy price cross-check (`shopPricePerCentiSCU × 100` vs `price / quantityScu`,
-  within 0.1% on 21/21 real buys);
-- the unit token rule (`quantity[... cSCU]` on buys 21/21, bare on sells 70/70).
+  within 0.1% on 22/22 real buys);
+- the unit token rule (`quantity[... cSCU]` on buys 21/21, bare on sells 71/71).
 
 ## What the log does *not* tell you about location
 
@@ -294,7 +294,7 @@ stable discriminant the UI switches on.
 
 ## Corrections to PLAN.md learned from real logs
 
-PLAN.md was written against one session. A corpus of 11 sessions (game builds Dec 2025 →
+PLAN.md was written against one session. A corpus of 12 sessions (game builds Dec 2025 →
 Oct 2026) in `src-tauri/tests/fixtures/` has since contradicted it in four places:
 
 1. **Parity must be summed over cargo box groups** — see above. The single most
