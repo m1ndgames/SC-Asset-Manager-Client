@@ -88,3 +88,62 @@ export const rescanLog = (
   path?: string,
   holdMs?: number,
 ): Promise<ScanReport> => invoke("rescan_log", { path, holdMs });
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+export type BackendKind = "firebase" | "pocketbase";
+
+export interface FirebaseConfig {
+  apiKey: string;
+  authDomain: string;
+  projectId: string;
+  storageBucket: string;
+  messagingSenderId: string;
+  appId: string;
+  measurementId?: string;
+}
+
+export interface PocketbaseConfig {
+  url: string;
+}
+
+/** Note the absence of `password` — it never crosses into the webview. */
+export interface ConfigDto {
+  schema: number;
+  nickname: string;
+  appUrl: string;
+  logPath: string;
+  pollIntervalMs: number;
+  graceWindowMs: number;
+  backendKind: BackendKind;
+  email: string;
+  passwordSet: boolean;
+  firebase: FirebaseConfig;
+  pocketbase: PocketbaseConfig;
+}
+
+/** Omit a field to leave it unchanged. Omit `password` to keep the stored one. */
+export interface ConfigPatch {
+  nickname?: string;
+  appUrl?: string;
+  logPath?: string;
+  pollIntervalMs?: number;
+  graceWindowMs?: number;
+  backendKind?: BackendKind;
+  email?: string;
+  password?: string;
+  firebase?: FirebaseConfig;
+  pocketbase?: PocketbaseConfig;
+}
+
+export const getConfig = (): Promise<ConfigDto> => invoke("get_config");
+
+export const setConfig = (patch: ConfigPatch): Promise<ConfigDto> =>
+  invoke("set_config", { patch });
+
+export const configFilePath = (): Promise<string> => invoke("config_file_path");
+
+export const parseFirebaseConfig = (text: string): Promise<FirebaseConfig> =>
+  invoke("parse_firebase_config", { text });

@@ -8,9 +8,11 @@
 //! PLAN.md here is the design of record.
 
 pub mod commands;
+pub mod config;
 pub mod error;
 pub mod ids;
 pub mod log;
+pub mod state;
 pub mod units;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -21,6 +23,13 @@ pub fn run() {
                 .unwrap_or_else(|_| "sc_asset_manager_client_lib=info".into()),
         )
         .init();
+
+    // A broken config must not stop the app from starting — the user needs
+    // Settings in order to fix it.
+    let cfg = config::load().unwrap_or_else(|e| {
+        tracing::error!(error = %e, "could not load config; starting with defaults");
+        config::Config::default()
+    });
 
     tauri::Builder::default()
         // Two tailers would double-write every trade. A second launch must
@@ -34,9 +43,14 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(state::AppState::new(cfg))
         .invoke_handler(tauri::generate_handler![
             commands::detect_log_path,
             commands::rescan_log,
+            commands::get_config,
+            commands::set_config,
+            commands::config_file_path,
+            commands::parse_firebase_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
