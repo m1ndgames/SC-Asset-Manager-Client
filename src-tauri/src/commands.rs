@@ -559,3 +559,45 @@ pub fn export_history_csv(state: State<'_, AppState>, path: String) -> AppResult
     tracing::info!(path = %path, rows = items.len(), "history exported");
     Ok(items.len())
 }
+
+/// What approving this buy would do to an existing asset, if anything.
+///
+/// Read-only and tolerant of being unavailable, exactly like `preview_sell`:
+/// `None` means the check could not run, which the card must not render as
+/// "no merge". Shares `plan_merge` with the write, so what the user is shown
+/// is what will happen.
+#[tauri::command]
+pub async fn preview_merge(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<Option<crate::writer::MergePlan>> {
+    let item = {
+        let q = state.queue.lock().unwrap();
+        q.get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::Queue(format!("{id} is not in the queue")))?
+    };
+    if item.detected.line.kind != crate::ids::TradeKind::Buy || item.merge_opt_out() {
+        return Ok(None);
+    }
+
+    let cfg = state.config();
+    let BackendKind::Firebase = cfg.backend.kind else {
+        return Ok(None);
+    };
+    let Ok(backend) = FirebaseBackend::from_config(&cfg) else {
+        return Ok(None);
+    };
+
+    let refdata = state.refdata();
+    let Ok(asset) = crate::writer::build_asset(&item, &refdata, &cfg.nickname) else {
+        return Ok(None);
+    };
+    match crate::writer::plan_merge(&backend, &asset).await {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            tracing::warn!(error = %e, id = %id, "could not preview the merge");
+            Ok(None)
+        }
+    }
+}

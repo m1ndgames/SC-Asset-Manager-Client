@@ -91,6 +91,12 @@ pub struct ItemEdits {
     /// data model should make it unrepresentable.
     #[serde(default)]
     pub display_unit: Option<CargoUnit>,
+    /// Write this buy as its own asset row instead of merging it into an
+    /// existing one. INTEGRATIONS.md section 8 offers both; merging is the
+    /// default because it is what the web app itself does, and this is the
+    /// escape hatch for keeping lots apart.
+    #[serde(default)]
+    pub separate_asset: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,6 +175,11 @@ impl QueueItem {
             .unwrap_or(self.detected.line.unit_price_per_scu)
     }
 
+    /// Whether the user asked for this buy to stay its own row.
+    pub fn merge_opt_out(&self) -> bool {
+        self.edits.separate_asset.unwrap_or(false)
+    }
+
     pub fn display_unit(&self) -> CargoUnit {
         // SCU is the contract's preferred unit, so it is also the default view.
         self.edits.display_unit.unwrap_or(CargoUnit::Scu)
@@ -242,6 +253,8 @@ pub struct ItemPatch {
     pub unit_price_per_scu: Option<Option<f64>>,
     #[serde(default)]
     pub display_unit: Option<CargoUnit>,
+    #[serde(default)]
+    pub separate_asset: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +396,9 @@ impl Queue {
         if let Some(u) = patch.display_unit {
             item.edits.display_unit = Some(u);
         }
+        if let Some(v) = patch.separate_asset {
+            item.edits.separate_asset = Some(v);
+        }
         item.updated_at = now_iso();
         self.persist()?;
         self.get(id).ok_or_else(|| missing(id))
@@ -441,6 +457,28 @@ impl Queue {
         let claimed = item.clone();
         self.persist()?;
         Ok(Some(claimed))
+    }
+
+    /// Journal that a merge is about to be attempted, and fsync before
+    /// returning.
+    ///
+    /// This is the crash guard for the only non-idempotent operation in the
+    /// design. It must be called *before* the backend is touched, because the
+    /// dangerous window is "the merge landed but we never recorded it" — a
+    /// resumed item would then add the same quantity a second time, silently,
+    /// into a shared inventory.
+    ///
+    /// Recording it first makes the opposite failure the possible one: we
+    /// believe a merge applied when it did not. That costs a missing buy,
+    /// which is visible in the web app and correctable by hand, and is the
+    /// side to err on. `Queue::open` reads `merge_applied` and promotes a
+    /// `Writing` item straight to `Written` rather than retrying it.
+    pub fn mark_merging(&mut self, id: &str, target_id: &str) -> AppResult<()> {
+        let item = self.item_mut(id)?;
+        item.merge_target_id = Some(target_id.to_string());
+        item.merge_applied = true;
+        item.updated_at = now_iso();
+        self.persist()
     }
 
     pub fn mark_written(&mut self, id: &str) -> AppResult<()> {

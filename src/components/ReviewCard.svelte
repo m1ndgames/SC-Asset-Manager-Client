@@ -19,12 +19,14 @@
     rejectItem,
     retryItem,
     previewSell,
+    previewMerge,
     isAppError,
     type ItemView,
     type RefData,
     type CargoUnit,
     type ItemPatch,
     type SellPreview,
+    type MergePlan,
   } from "../lib/ipc";
   import { remember, suggestionFor, recentLocations } from "../lib/suggestions.svelte";
 
@@ -48,6 +50,28 @@
   // other is an orphan trade, and showing the wrong one would mislead.
   let preview = $state<SellPreview | null>(null);
   let previewing = $state(false);
+
+  // The buy equivalent. Same null-means-unknown rule.
+  let merge = $state<MergePlan | null>(null);
+
+  $effect(() => {
+    if (item.detected.kind !== "buy") return;
+    // Re-checked when the amount, the item or the opt-out changes: all three
+    // change what the merge would do, or whether there is one at all.
+    const key = `${item.id}|${item.effectiveAmountScu}|${item.effectiveUnitPricePerScu}|${item.edits.location}|${item.edits.separateAsset}`;
+    let cancelled = false;
+    previewMerge(item.id)
+      .then((m) => {
+        if (!cancelled) merge = m;
+      })
+      .catch(() => {
+        if (!cancelled) merge = null;
+      });
+    void key;
+    return () => {
+      cancelled = true;
+    };
+  });
 
   // Re-checked whenever the amount or the resolved item changes, since both
   // change which asset is hit and whether it is over-sold.
@@ -391,6 +415,61 @@
         written as {qty(item.effectiveAmountScu)} SCU @ {price(item.effectiveUnitPricePerScu)}
       </span>
     </div>
+
+    <!-- A merge is the one operation in this app that cannot be undone by
+         repeating it, so what it will do is spelled out in full before the
+         user commits. -->
+    {#if isBuy && merge}
+      <div class="mt-3 border border-accent/40 bg-accent/5 px-2 py-2">
+        <p class="font-display text-[10px] tracking-[0.2em] text-muted uppercase">
+          Merges into an existing asset
+        </p>
+        <p class="mt-1 font-mono text-sm text-text">
+          {qty(merge.oldAmount)} → <span class="text-accent">{qty(merge.newAmount)}</span>
+          <span class="text-xs text-muted">{merge.unit}</span>
+          · {price(merge.oldBuyPrice)} →
+          <span class="text-accent">{price(merge.newBuyPrice)}</span>
+          <span class="text-xs text-muted">aUEC/{merge.unit} (quantity-weighted)</span>
+        </p>
+        <p class="mt-1 text-xs text-muted">
+          Adding {qty(merge.addedAmount)}
+          {merge.unit} at {price(merge.addedBuyPrice)} to the existing lot at {merge.location}.
+          No new row is created.
+        </p>
+        {#if merge.alsoMatching.length}
+          <p class="mt-1 text-xs text-warn-text">
+            {merge.alsoMatching.length} other asset{merge.alsoMatching.length === 1
+              ? ""
+              : "s"} already exist here. The oldest is used; the rest stay as they are.
+          </p>
+        {/if}
+        <p class="mt-2 text-xs text-muted">
+          Unlike everything else this app writes, a merge cannot simply be
+          repeated — it adds. It is recorded before it is attempted so an
+          interrupted write is never applied twice.
+        </p>
+      </div>
+    {/if}
+
+    {#if isBuy}
+      <label class="mt-2 flex cursor-pointer items-start gap-2">
+        <input
+          type="checkbox"
+          class="mt-0.5 accent-accent"
+          checked={item.edits.separateAsset ?? false}
+          onchange={(e) =>
+            patch({ separateAsset: (e.currentTarget as HTMLInputElement).checked })}
+        />
+        <span class="text-xs text-muted">
+          Keep this buy as its own asset row
+          {#if merge}
+            — instead of merging it into {merge.targetId.slice(0, 8)}…
+          {:else}
+            — it has nothing to merge into anyway
+          {/if}
+        </span>
+      </label>
+    {/if}
 
     <!-- A sell mutates something that already exists, so the card has to say
          what it will hit before the user commits to it. -->

@@ -99,6 +99,14 @@ impl MockBackend {
         self.inner.lock().unwrap().assets.get(id).cloned()
     }
 
+    /// Change an asset behind the writer's back, to model another client
+    /// touching the same document mid-operation.
+    pub fn set_amount(&self, id: &str, amount: f64) {
+        if let Some(a) = self.inner.lock().unwrap().assets.get_mut(id) {
+            a.amount = amount;
+        }
+    }
+
     pub fn asset_count(&self) -> usize {
         self.inner.lock().unwrap().assets.len()
     }

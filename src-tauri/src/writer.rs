@@ -36,6 +36,9 @@ use crate::units::{self, CargoUnit};
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteOutcome {
     pub asset: AssetRecord,
+    /// Set when this buy was folded into an existing asset instead of being
+    /// written as its own row.
+    pub merged: Option<MergePlan>,
     /// Assets that already existed with this item and location. Non-empty means
     /// the app's merge rule *would* have merged; Phase 3 writes a separate row
     /// and says so rather than deciding for the user.
@@ -114,15 +117,19 @@ pub async fn merge_candidates(
 /// after an ambiguous failure cannot produce a second record or leave stale
 /// fields behind. That is what lets the queue re-run an interrupted write
 /// without any reconciliation.
-pub async fn write_buy(
+pub async fn write_buy<F>(
     backend: &dyn SyncBackend,
     item: &QueueItem,
     refdata: &RefData,
     nickname: &str,
-) -> BackendResult<WriteOutcome> {
+    record_merge: F,
+) -> BackendResult<WriteOutcome>
+where
+    F: FnOnce(&MergePlan) -> BackendResult<()>,
+{
     if item.detected.line.kind != crate::ids::TradeKind::Buy {
         return Err(BackendError::Other(format!(
-            "{} is a sell and must go through write_sell, which writes a trade \n             first and then mutates the asset",
+            "{} is a sell and must go through write_sell",
             item.id
         )));
     }
@@ -143,23 +150,70 @@ pub async fn write_buy(
         )));
     }
 
-    // Informational, and gathered *before* the write so the count describes the
-    // state the user was told about rather than including our own new row.
-    let would_have_merged_into = merge_candidates(backend, &asset).await;
+    // Gathered *before* the write, so it describes the state the user was
+    // shown rather than including our own new row.
+    let plan = if item.merge_opt_out() {
+        None
+    } else {
+        plan_merge(backend, &asset).await?
+    };
 
-    backend.upsert_asset(&asset).await?;
+    let Some(plan) = plan else {
+        // No candidate, or the user asked for a separate row: a plain
+        // idempotent upsert on a deterministic id, safe to repeat.
+        backend.upsert_asset(&asset).await?;
+        return Ok(WriteOutcome {
+            asset,
+            merged: None,
+            would_have_merged_into: Vec::new(),
+        });
+    };
 
-    if !would_have_merged_into.is_empty() {
-        tracing::info!(
-            id = %asset.id,
-            existing = ?would_have_merged_into,
-            "wrote a separate asset where the app would have merged (Phase 5)"
-        );
+    // ---- From here on the operation is NOT idempotent. ----
+    //
+    // Adding to an existing amount cannot be repeated safely: a second attempt
+    // adds the quantity again. So the intent is journalled to `queue.json`
+    // *before* the backend is touched, and `Queue::open` treats a `Writing`
+    // item with `merge_applied` as `Written` rather than retrying it. That
+    // trades a possible missed merge (recoverable, visible in the web app) for
+    // an impossible double-count (silent, and corrupts the shared inventory).
+    //
+    // `record_merge` is a parameter rather than something this function does
+    // itself because `writer.rs` must stay backend- and queue-agnostic. Making
+    // it an argument means no caller can reach the non-idempotent path without
+    // having said what to do about the journal.
+    record_merge(&plan)?;
+
+    let target = backend.get_asset(&plan.target_id).await?.ok_or_else(|| {
+        BackendError::Other(format!(
+            "the asset {} vanished between planning the merge and applying it",
+            plan.target_id
+        ))
+    })?;
+    // Re-check: between the plan and now, someone else may have changed it.
+    if (target.amount - plan.old_amount).abs() > 1e-9 {
+        return Err(BackendError::Other(format!(
+            "{} changed from {} to {} while this merge was being approved; \
+             review it again",
+            plan.target_id, plan.old_amount, target.amount
+        )));
     }
+
+    backend.upsert_asset(&merged_record(target, &plan)).await?;
+
+    tracing::info!(
+        into = %plan.target_id,
+        amount = plan.new_amount,
+        buy_price = plan.new_buy_price,
+        "merged a buy into an existing asset"
+    );
 
     Ok(WriteOutcome {
         asset,
-        would_have_merged_into,
+        would_have_merged_into: std::iter::once(plan.target_id.clone())
+            .chain(plan.also_matching.iter().cloned())
+            .collect(),
+        merged: Some(plan),
     })
 }
 
@@ -509,4 +563,104 @@ pub async fn preview_sell(
         over_sold_by: plan.over_sold_by,
         profit,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The buy merge rule (INTEGRATIONS.md §8)
+// ---------------------------------------------------------------------------
+
+/// What merging this buy into an existing asset would do.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePlan {
+    pub target_id: String,
+    /// Denominated in the **target's** unit throughout, which is what gets
+    /// written — the target already exists and its unit is not ours to change.
+    pub unit: CargoUnit,
+    pub old_amount: f64,
+    pub old_buy_price: f64,
+    pub added_amount: f64,
+    pub added_buy_price: f64,
+    pub new_amount: f64,
+    /// Quantity-weighted, never a plain mean: two lots of different sizes do
+    /// not contribute equally to what the inventory cost.
+    pub new_buy_price: f64,
+    pub location: String,
+    /// Other assets with the same item and location. More than zero means the
+    /// inventory was already untidy before this buy; the oldest is chosen.
+    pub also_matching: Vec<String>,
+}
+
+/// Decide whether this buy merges, and into what.
+///
+/// §8: "if an asset already exists with the same `item` and the same
+/// `location`, add to its `amount`". Location **is** part of the key here,
+/// unlike the sell lookup — a buy creates stock in a place, whereas a sell
+/// ships stock that has since moved. The asymmetry is deliberate; see
+/// CLAUDE.md.
+pub async fn plan_merge(
+    backend: &dyn SyncBackend,
+    asset: &AssetRecord,
+) -> BackendResult<Option<MergePlan>> {
+    let mut candidates: Vec<AssetRecord> = backend
+        .find_assets(&asset.item, Some(&asset.location))
+        .await?
+        .into_iter()
+        // Never merge a record into itself. Reachable on a retry, where the
+        // first attempt already wrote this very document.
+        .filter(|a| a.id != asset.id)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    // Oldest first, id as the tiebreak, exactly as the sell lookup — a retry
+    // must choose the same target or it could double-count into a second row.
+    candidates.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    let target = candidates.remove(0);
+    let unit = target.unit.unwrap_or(CargoUnit::Scu);
+
+    // Our figures are per-SCU; the target's are in its own unit.
+    let added_amount = units::convert(asset.amount, CargoUnit::Scu, unit);
+    let added_buy_price = units::convert_price(asset.buy_price, CargoUnit::Scu, unit);
+
+    let new_buy_price = units::weighted_average_price(
+        target.amount,
+        target.buy_price,
+        added_amount,
+        added_buy_price,
+    )
+    .ok_or_else(|| {
+        BackendError::Other(format!(
+            "cannot merge into {}: the combined amount is not a usable number",
+            target.id
+        ))
+    })?;
+
+    Ok(Some(MergePlan {
+        target_id: target.id.clone(),
+        unit,
+        old_amount: target.amount,
+        old_buy_price: target.buy_price,
+        added_amount,
+        added_buy_price,
+        new_amount: target.amount + added_amount,
+        new_buy_price,
+        location: target.location.clone(),
+        also_matching: candidates.into_iter().map(|a| a.id).collect(),
+    }))
+}
+
+/// Apply a merge: the target gains the amount and takes the weighted price.
+///
+/// Every other field is carried over from the target untouched, and `quality`
+/// and `uexBuyId` are not in the update mask at all, so the web app's values
+/// survive a merge even though this client never sets them. That is the whole
+/// reason the mask is explicit — see the Firestore semantics in CLAUDE.md.
+fn merged_record(target: AssetRecord, plan: &MergePlan) -> AssetRecord {
+    AssetRecord {
+        amount: plan.new_amount,
+        buy_price: plan.new_buy_price,
+        ..target
+    }
 }

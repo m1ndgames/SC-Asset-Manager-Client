@@ -566,3 +566,115 @@ fn a_buy_is_still_approvable() {
     q.approve(&id, &rd).expect("a located, resolved buy approves");
     assert_eq!(q.get(&id).unwrap().state, ItemState::Approved);
 }
+
+// ---------------------------------------------------------------------------
+// The merge crash guard, from the queue's side
+// ---------------------------------------------------------------------------
+
+/// The recovery rule that makes merging survivable. A `Writing` item is
+/// normally returned to `Approved` and retried, because every other write is
+/// an idempotent upsert. A merge is not: retrying adds the quantity again. So
+/// a journalled merge is promoted straight to `Written` instead.
+#[test]
+fn a_crashed_merge_is_never_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let id = {
+        let mut q = Queue::open(dir.path());
+        let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+        q.update(&id, located("Port Tressler")).unwrap();
+        q.approve(&id, &rd).unwrap();
+        q.claim_for_writing().unwrap().unwrap();
+        // Journalled, then the process dies before the backend answers.
+        q.mark_merging(&id, "some-older-asset").unwrap();
+        id
+    };
+
+    let reopened = Queue::open(dir.path());
+    let item = reopened.get(&id).expect("still there");
+    assert_eq!(
+        item.state,
+        ItemState::Written,
+        "a journalled merge must not be retried -- repeating it double-counts"
+    );
+    assert_eq!(item.merge_target_id.as_deref(), Some("some-older-asset"));
+    assert!(item.merge_applied);
+}
+
+/// The contrast, so the rule above is not just "never retry anything": an
+/// ordinary interrupted write goes back to `Approved` and is retried, which is
+/// safe because the id is deterministic and the write is an upsert.
+#[test]
+fn a_crashed_plain_write_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let id = {
+        let mut q = Queue::open(dir.path());
+        let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+        q.update(&id, located("Port Tressler")).unwrap();
+        q.approve(&id, &rd).unwrap();
+        q.claim_for_writing().unwrap().unwrap();
+        id
+    };
+
+    let reopened = Queue::open(dir.path());
+    assert_eq!(reopened.get(&id).unwrap().state, ItemState::Approved);
+}
+
+/// CLAUDE.md: a full rescan must not resurrect a merged buy. It cannot, and
+/// this is why — `enqueue` refuses an id that is already in history, so
+/// re-reading the log from byte 0 offers nothing that was already applied.
+/// Without this, a replay would add the same quantity to the same asset again.
+#[test]
+fn a_rescan_cannot_resurrect_a_merged_buy() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let mut q = Queue::open(dir.path());
+
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.update(&id, located("Port Tressler")).unwrap();
+    q.approve(&id, &rd).unwrap();
+    q.claim_for_writing().unwrap().unwrap();
+    q.mark_merging(&id, "older").unwrap();
+    q.mark_written(&id).unwrap(); // retires into history itself
+
+    // The rescan re-reads the very same line.
+    let err = q
+        .enqueue(detected(BUY))
+        .expect_err("a written merge must not come back");
+    assert!(err.to_string().contains("already written"), "{err}");
+    assert!(q.items().is_empty(), "nothing re-queued");
+
+    // And it survives a restart, since history is on disk.
+    let mut reopened = Queue::open(dir.path());
+    assert!(reopened.enqueue(detected(BUY)).is_err());
+}
+
+/// The opt-out round-trips like any other edit, and does not disturb the rest.
+#[test]
+fn the_separate_asset_opt_out_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.update(&id, located("Port Tressler")).unwrap();
+
+    assert!(!q.get(&id).unwrap().merge_opt_out(), "merging is the default");
+
+    q.update(
+        &id,
+        ItemPatch {
+            separate_asset: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(q.get(&id).unwrap().merge_opt_out());
+    assert_eq!(
+        q.get(&id).unwrap().location(),
+        Some("Port Tressler"),
+        "an unrelated edit must survive"
+    );
+
+    let reopened = Queue::open(dir.path());
+    assert!(reopened.get(&id).unwrap().merge_opt_out());
+}

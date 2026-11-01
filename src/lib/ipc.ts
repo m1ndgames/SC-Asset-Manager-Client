@@ -257,6 +257,7 @@ export interface ItemEdits {
   amountScu: number | null;
   unitPricePerScu: number | null;
   displayUnit: CargoUnit | null;
+  separateAsset: boolean | null;
 }
 
 /** One queue item plus everything derived, as the card renders it. */
@@ -298,6 +299,7 @@ export interface ItemPatch {
   amountScu?: number | null;
   unitPricePerScu?: number | null;
   displayUnit?: CargoUnit;
+  separateAsset?: boolean;
 }
 
 export interface Commodity {
@@ -352,6 +354,27 @@ export interface SellPreview {
   profit: number | null;
 }
 
+/**
+ * What approving a buy would do to an existing asset.
+ *
+ * Every figure is in the TARGET's unit: it already exists and its unit is not
+ * ours to change. `null` from the command means the check could not run --
+ * which is NOT the same as "nothing to merge into".
+ */
+export interface MergePlan {
+  targetId: string;
+  unit: CargoUnit;
+  oldAmount: number;
+  oldBuyPrice: number;
+  addedAmount: number;
+  addedBuyPrice: number;
+  newAmount: number;
+  /** Quantity-weighted, never a plain mean. */
+  newBuyPrice: number;
+  location: string;
+  alsoMatching: string[];
+}
+
 /** Events the write path emits. */
 export const QEV = {
   written: "tx://written",
@@ -381,6 +404,9 @@ export const drainQueue = (): Promise<DrainReport> => invoke("drain_queue");
 
 export const previewSell = (id: string): Promise<SellPreview | null> =>
   invoke("preview_sell", { id });
+
+export const previewMerge = (id: string): Promise<MergePlan | null> =>
+  invoke("preview_merge", { id });
 
 /** Writes the CSV in Rust: the renderer has no filesystem access. */
 export const exportHistoryCsv = (path: string): Promise<number> =>

@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phases 0-4 are done**, plus the History view and autostart. What exists and
-passes (219 tests green, clippy clean):
+**Phases 0-5 are done**, plus the History view and autostart. What exists and
+passes (231 tests green, clippy clean):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -48,8 +48,17 @@ passes (219 tests green, clippy clean):
   "nothing is read until the user says so" invariant: that path defaults an
   unseen log to start-from-now and never backfills silently.
 
-**Not built yet:** the buy merge rule (Phase 5) and PocketBase (Phase 6).
-History has no retry/restore actions yet — it is read-only plus export.
+- **The buy merge rule:** `plan_merge` (keyed on item **and** location, per §8)
+  and the quantity-weighted price. `write_buy` now takes a `record_merge`
+  callback that it invokes immediately *before* the non-idempotent write — a
+  parameter rather than something `writer.rs` does itself, so no caller can
+  reach that path without having said what to do about the journal. `drain`
+  passes a closure that calls `Queue::mark_merging`. The target is re-read and
+  checked against the plan before applying, so a concurrent change is refused
+  rather than overwritten. `edits.separate_asset` is the opt-out.
+
+**Not built yet:** PocketBase (Phase 6) and packaging (Phase 8). History has no
+retry/restore actions yet — it is read-only plus export.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an

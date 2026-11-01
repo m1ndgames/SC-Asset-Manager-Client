@@ -180,9 +180,27 @@ pub async fn drain(app: &AppHandle) -> DrainReport {
         // genuinely different operations: a buy writes one asset and no trade;
         // a sell writes a trade and *then* mutates or deletes an asset.
         let result = match item.detected.line.kind {
-            TradeKind::Buy => crate::writer::write_buy(backend.as_ref(), &item, &refdata, &nickname)
-                .await
-                .map(|o| WrittenSummary::from_buy(&o)),
+            TradeKind::Buy => {
+                // The merge journal. Called by `write_buy` immediately before
+                // the non-idempotent write, and it takes the queue lock for
+                // just that moment -- no guard is held across the await,
+                // because this closure is synchronous and returns before the
+                // backend is touched.
+                let journal = |plan: &crate::writer::MergePlan| {
+                    let mut q = state.queue.lock().unwrap();
+                    q.mark_merging(&item.id, &plan.target_id).map_err(|e| {
+                        // Refusing here aborts before the backend call, which
+                        // is the safe direction: no merge is better than an
+                        // unrecorded one.
+                        crate::backend::BackendError::Other(format!(
+                            "could not journal the merge, so it was not attempted: {e}"
+                        ))
+                    })
+                };
+                crate::writer::write_buy(backend.as_ref(), &item, &refdata, &nickname, journal)
+                    .await
+                    .map(|o| WrittenSummary::from_buy(&o))
+            }
             TradeKind::Sell => {
                 crate::writer::write_sell(backend.as_ref(), &item, &refdata, &nickname)
                     .await

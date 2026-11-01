@@ -225,7 +225,7 @@ async fn a_buy_writes_one_asset_and_no_trade() {
     let (_d, item) = approved(BUY, "Port Tressler");
     let backend = MockBackend::new();
 
-    let out = write_buy(&backend, &item, &refdata(), "m1nd").await.unwrap();
+    let out = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
 
     assert_eq!(backend.asset_count(), 1);
     assert_eq!(out.asset.item, "Ammonia");
@@ -251,8 +251,8 @@ async fn writing_twice_is_idempotent() {
     let (_d, item) = approved(BUY, "Port Tressler");
     let backend = MockBackend::new();
 
-    let first = write_buy(&backend, &item, &refdata(), "m1nd").await.unwrap();
-    let second = write_buy(&backend, &item, &refdata(), "m1nd").await.unwrap();
+    let first = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
+    let second = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
 
     assert_eq!(backend.asset_count(), 1, "no second document");
     // `createdAt` is our clock, so it may differ; everything the contract
@@ -272,22 +272,22 @@ async fn a_failed_write_writes_nothing_and_a_retry_lands_cleanly() {
         ..Default::default()
     });
 
-    let err = write_buy(&backend, &item, &refdata(), "m1nd")
+    let err = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(()))
         .await
         .unwrap_err();
     assert_eq!(err.kind(), "network");
     assert_eq!(backend.asset_count(), 0, "a failure must not half-write");
 
-    write_buy(&backend, &item, &refdata(), "m1nd").await.unwrap();
+    write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
     assert_eq!(backend.asset_count(), 1);
     assert_eq!(backend.asset(&item.id).unwrap().amount, 64.0);
 }
 
-/// Phase 3 writes one asset per log line. INTEGRATIONS.md §8 sanctions this
-/// ("strict replay safety ... rather than a tidy inventory"), but the user has
-/// to be told, so the outcome names what would have been merged.
+/// §8: "if an asset already exists with the same `item` and the same
+/// `location`, add to its `amount`". The price becomes quantity-weighted, and
+/// no second row appears.
 #[tokio::test]
-async fn an_existing_asset_is_reported_not_merged_into() {
+async fn a_buy_merges_into_an_existing_asset_at_the_same_location() {
     let (_d, item) = approved(BUY, "Port Tressler");
     let existing = AssetRecord {
         id: "an-older-asset".into(),
@@ -304,15 +304,23 @@ async fn an_existing_asset_is_reported_not_merged_into() {
     };
     let backend = MockBackend::new().with_asset(existing);
 
-    let out = write_buy(&backend, &item, &refdata(), "m1nd").await.unwrap();
+    let out = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
 
-    assert_eq!(out.would_have_merged_into, vec!["an-older-asset".to_string()]);
-    assert_eq!(backend.asset_count(), 2, "a separate row, not a merge");
-    // The existing asset must be untouched — no quantity added, no price
-    // overwritten. Phase 5 is what changes this.
-    let older = backend.asset("an-older-asset").unwrap();
-    assert_eq!(older.amount, 100.0);
-    assert_eq!(older.buy_price, 500.0);
+    let merged = out.merged.expect("should have merged");
+    assert_eq!(merged.target_id, "an-older-asset");
+    assert_eq!(backend.asset_count(), 1, "merged, so no second row");
+
+    let after = backend.asset("an-older-asset").unwrap();
+    // 100 SCU at 500, plus 64 SCU at 782.32.
+    assert_eq!(after.amount, 164.0);
+    let expected = (100.0 * 500.0 + 64.0 * 782.32) / 164.0;
+    assert!(
+        (after.buy_price - expected).abs() < 1e-9,
+        "quantity-weighted, not a plain mean: {} vs {expected}",
+        after.buy_price
+    );
+    // The new buy's own id must NOT have become a document.
+    assert!(backend.asset(&item.id).is_none(), "a merge writes no new row");
 }
 
 /// A different location is a different asset, so there is nothing to report.
@@ -333,30 +341,37 @@ async fn an_asset_elsewhere_is_not_a_merge_candidate() {
         uex_buy_id: None,
     });
 
-    let out = write_buy(&backend, &item, &refdata(), "m1nd").await.unwrap();
+    let out = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
     assert!(out.would_have_merged_into.is_empty());
 }
 
-/// Checking for merge candidates is informational. If it fails, the buy must
-/// still be written — refusing would mean a network blip loses the trade.
+/// The candidate lookup is load-bearing now that merging is the default, so a
+/// failure has to stop the write rather than be shrugged off.
+///
+/// Phase 3 continued here, because the check was only informational. It is
+/// not any more: proceeding blind would write a separate row while the card
+/// had just shown the user a merge, and silently doing something other than
+/// what was previewed is worse than a retryable failure.
 #[tokio::test]
-async fn a_failed_merge_check_does_not_block_the_write() {
+async fn a_failed_merge_check_stops_the_write_rather_than_guessing() {
     let (_d, item) = approved(BUY, "Port Tressler");
     let backend = MockBackend::new().with_faults(Faults {
         fail_find: true,
         ..Default::default()
     });
 
-    let out = write_buy(&backend, &item, &refdata(), "m1nd").await.unwrap();
-    assert!(out.would_have_merged_into.is_empty());
-    assert_eq!(backend.asset_count(), 1);
+    let err = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("find failed"), "{err}");
+    assert_eq!(backend.asset_count(), 0, "nothing written on an unknown state");
 }
 
 #[tokio::test]
 async fn write_buy_refuses_a_sell() {
     let (_d, item) = unapproved(SELL, "Port Tressler");
     let backend = MockBackend::new();
-    let err = write_buy(&backend, &item, &refdata(), "m1nd")
+    let err = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(()))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("write_sell"), "{err}");
@@ -388,7 +403,7 @@ async fn an_empty_id_is_refused_before_any_write() {
     let backend = MockBackend::new();
 
     item.id = "   ".into();
-    let err = write_buy(&backend, &item, &refdata(), "m1nd")
+    let err = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(()))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("empty id"), "{err}");
@@ -676,4 +691,188 @@ async fn a_sell_never_creates_an_asset() {
         "{:?}",
         backend.calls()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The merge crash guard
+// ---------------------------------------------------------------------------
+
+fn existing(id: &str, amount: f64, price: f64, location: &str, created: &str) -> AssetRecord {
+    AssetRecord {
+        id: id.into(),
+        item: "Ammonia".into(),
+        amount,
+        unit: Some(CargoUnit::Scu),
+        buy_price: price,
+        location: location.into(),
+        quality: None,
+        created_at: created.into(),
+        logged_by: Some("m1nd".into()),
+        source: Some("log-watcher".into()),
+        uex_buy_id: None,
+    }
+}
+
+/// The journal must be written **before** the backend is touched. If the
+/// process dies between the two, the recorded intent is what stops a resumed
+/// item adding the same quantity twice.
+#[tokio::test]
+async fn the_merge_is_journalled_before_the_backend_call() {
+    let (_d, item) = approved(BUY, "Port Tressler");
+    let backend =
+        MockBackend::new().with_asset(existing("a1", 100.0, 500.0, "Port Tressler", "2026-10-01T00:00:00.000Z"));
+
+    let journalled = std::sync::Mutex::new(Vec::<String>::new());
+    write_buy(&backend, &item, &refdata(), "m1nd", |plan| {
+        // At the moment the journal is called, the merge must not have
+        // happened yet.
+        assert_eq!(
+            backend.asset("a1").unwrap().amount,
+            100.0,
+            "journal ran after the write -- the crash guard is useless"
+        );
+        journalled.lock().unwrap().push(plan.target_id.clone());
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(*journalled.lock().unwrap(), vec!["a1".to_string()]);
+    assert_eq!(backend.asset("a1").unwrap().amount, 164.0);
+}
+
+/// If the journal cannot be written, the merge must not be attempted at all.
+/// No merge is recoverable; an unrecorded one is not.
+#[tokio::test]
+async fn a_failed_journal_aborts_before_anything_is_written() {
+    let (_d, item) = approved(BUY, "Port Tressler");
+    let backend =
+        MockBackend::new().with_asset(existing("a1", 100.0, 500.0, "Port Tressler", "2026-10-01T00:00:00.000Z"));
+
+    let err = write_buy(&backend, &item, &refdata(), "m1nd", |_| {
+        Err(crate::backend::BackendError::Other("disk full".into()))
+    })
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("disk full"), "{err}");
+    assert_eq!(backend.asset("a1").unwrap().amount, 100.0, "untouched");
+    assert_eq!(backend.asset_count(), 1, "and no new row either");
+}
+
+/// A buy is never merged into a row at a different place. §8 keys the merge on
+/// item AND location, unlike a sell.
+#[tokio::test]
+async fn a_buy_does_not_merge_across_locations() {
+    let (_d, item) = approved(BUY, "Port Tressler");
+    let backend =
+        MockBackend::new().with_asset(existing("elsewhere", 100.0, 500.0, "Area18", "2026-10-01T00:00:00.000Z"));
+
+    let out = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
+
+    assert!(out.merged.is_none(), "different location, so a new row");
+    assert_eq!(backend.asset_count(), 2);
+    assert_eq!(backend.asset("elsewhere").unwrap().amount, 100.0);
+}
+
+/// The opt-out: the user asked for this lot to stay separate.
+#[tokio::test]
+async fn opting_out_writes_a_separate_row_and_never_journals() {
+    let (_d, mut item) = approved(BUY, "Port Tressler");
+    item.edits.separate_asset = Some(true);
+    let backend =
+        MockBackend::new().with_asset(existing("a1", 100.0, 500.0, "Port Tressler", "2026-10-01T00:00:00.000Z"));
+
+    let out = write_buy(&backend, &item, &refdata(), "m1nd", |_| {
+        panic!("opting out must not reach the non-idempotent path")
+    })
+    .await
+    .unwrap();
+
+    assert!(out.merged.is_none());
+    assert_eq!(backend.asset_count(), 2);
+    assert_eq!(backend.asset("a1").unwrap().amount, 100.0, "untouched");
+    assert_eq!(backend.asset(&item.id).unwrap().amount, 64.0, "its own row");
+}
+
+/// Merging is the one operation a blind retry corrupts, so the target is
+/// re-read and checked against the plan. A changed amount means someone else
+/// touched it and the arithmetic the user approved no longer holds.
+#[tokio::test]
+async fn a_target_that_changed_under_us_is_refused_rather_than_merged() {
+    let (_d, item) = approved(BUY, "Port Tressler");
+    let backend =
+        MockBackend::new().with_asset(existing("a1", 100.0, 500.0, "Port Tressler", "2026-10-01T00:00:00.000Z"));
+
+    let err = write_buy(&backend, &item, &refdata(), "m1nd", |_| {
+        // Simulate a concurrent change landing between plan and apply.
+        backend.set_amount("a1", 250.0);
+        Ok(())
+    })
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("changed from"), "{err}");
+    assert_eq!(
+        backend.asset("a1").unwrap().amount,
+        250.0,
+        "left as the other writer set it, not overwritten"
+    );
+}
+
+/// Quantity-weighting across units: the target is the one that exists, so its
+/// unit wins and our per-SCU figures are converted into it.
+#[tokio::test]
+async fn a_merge_into_a_centi_scu_asset_converts_rather_than_mixing_units() {
+    let (_d, item) = approved(BUY, "Port Tressler");
+    let mut target = existing("a1", 10_000.0, 5.0, "Port Tressler", "2026-10-01T00:00:00.000Z");
+    target.unit = Some(CargoUnit::CentiScu); // 10 000 cSCU == 100 SCU, 5/cSCU == 500/SCU
+    let backend = MockBackend::new().with_asset(target);
+
+    let out = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
+    let merged = out.merged.expect("merged");
+
+    assert_eq!(merged.unit, CargoUnit::CentiScu);
+    // 64 SCU == 6 400 cSCU, at 782.32/SCU == 7.8232/cSCU.
+    assert_eq!(merged.added_amount, 6_400.0);
+    assert!((merged.added_buy_price - 7.8232).abs() < 1e-9);
+    assert_eq!(merged.new_amount, 16_400.0);
+
+    let after = backend.asset("a1").unwrap();
+    assert_eq!(after.unit, Some(CargoUnit::CentiScu), "the unit is not ours to change");
+    assert_eq!(after.amount, 16_400.0);
+}
+
+/// A merge must not clobber the fields the web app owns.
+#[tokio::test]
+async fn a_merge_preserves_quality_and_uex_buy_id() {
+    let (_d, item) = approved(BUY, "Port Tressler");
+    let mut target = existing("a1", 100.0, 500.0, "Port Tressler", "2026-10-01T00:00:00.000Z");
+    target.quality = Some(815.0);
+    target.uex_buy_id = Some(4242);
+    let backend = MockBackend::new().with_asset(target);
+
+    write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
+
+    let after = backend.asset("a1").unwrap();
+    assert_eq!(after.quality, Some(815.0), "the web app owns quality");
+    assert_eq!(after.uex_buy_id, Some(4242), "never set, never destroyed");
+    assert_eq!(after.created_at, "2026-10-01T00:00:00.000Z", "still the original lot");
+}
+
+/// With several rows already at the same place, the oldest is the target and
+/// the others are reported rather than silently left out of the picture.
+#[tokio::test]
+async fn the_oldest_row_is_the_merge_target_and_the_rest_are_reported() {
+    let (_d, item) = approved(BUY, "Port Tressler");
+    let backend = MockBackend::new()
+        .with_asset(existing("newer", 10.0, 900.0, "Port Tressler", "2026-10-09T00:00:00.000Z"))
+        .with_asset(existing("oldest", 20.0, 100.0, "Port Tressler", "2026-10-01T00:00:00.000Z"));
+
+    let out = write_buy(&backend, &item, &refdata(), "m1nd", |_| Ok(())).await.unwrap();
+    let merged = out.merged.expect("merged");
+
+    assert_eq!(merged.target_id, "oldest");
+    assert_eq!(merged.also_matching, vec!["newer".to_string()]);
+    assert_eq!(backend.asset("newer").unwrap().amount, 10.0, "untouched");
 }
