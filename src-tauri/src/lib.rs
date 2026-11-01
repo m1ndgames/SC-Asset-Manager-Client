@@ -7,6 +7,12 @@
 //! INTEGRATIONS.md in the main repo is the authoritative data contract;
 //! PLAN.md here is the design of record.
 
+pub mod commands;
+pub mod error;
+pub mod ids;
+pub mod log;
+pub mod units;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -28,6 +34,10 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![
+            commands::detect_log_path,
+            commands::rescan_log,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
