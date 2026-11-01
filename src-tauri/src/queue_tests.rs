@@ -827,3 +827,48 @@ fn a_restored_trade_can_then_be_approved() {
     q.approve(&id, &rd).unwrap();
     assert_eq!(q.get(&id).unwrap().state, ItemState::Approved);
 }
+
+/// A journalled merge must not be retried, for the same reason it cannot be
+/// restored: the write may have landed before the error came back, and
+/// repeating it adds the quantity to the target a second time. `Queue::open`
+/// already refuses to retry such an item on load, so the Retry button must not
+/// be a way around that.
+#[test]
+fn a_failed_merge_cannot_be_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.update(&id, located("Port Tressler")).unwrap();
+    q.approve(&id, &rd).unwrap();
+    q.claim_for_writing().unwrap().unwrap();
+    q.mark_merging(&id, "older-asset").unwrap();
+    // The upsert landed server-side but the response timed out.
+    q.mark_failed(&id, "connection reset").unwrap();
+
+    let err = q.retry(&id).expect_err("retrying a merge double-counts it");
+    assert!(err.to_string().contains("older-asset"), "{err}");
+    assert_eq!(
+        q.get(&id).unwrap().state,
+        ItemState::Failed,
+        "and it stays failed rather than being queued for a second write"
+    );
+}
+
+/// The contrast: an ordinary failed write is retryable, because every
+/// non-merge write is an idempotent upsert on a deterministic id.
+#[test]
+fn a_failed_plain_write_is_still_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+    q.update(&id, located("Port Tressler")).unwrap();
+    q.approve(&id, &rd).unwrap();
+    q.claim_for_writing().unwrap().unwrap();
+    q.mark_failed(&id, "connection reset").unwrap();
+
+    q.retry(&id).expect("a plain write is idempotent");
+    assert_eq!(q.get(&id).unwrap().state, ItemState::Approved);
+    assert!(q.get(&id).unwrap().error.is_none());
+}

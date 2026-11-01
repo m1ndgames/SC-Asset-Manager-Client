@@ -297,11 +297,11 @@ pub fn write_atomic(tmp: &Path, target: &Path, bytes: &[u8]) -> AppResult<()> {
         f.sync_all()
             .map_err(|e| AppError::Config(format!("cannot flush temp file: {e}")))?;
     }
-    // Windows rename fails if the target exists, so remove it first. The window
-    // between the two is why the temp file is written and synced beforehand.
-    if target.exists() {
-        let _ = std::fs::remove_file(target);
-    }
+    // No `remove_file` first: `std::fs::rename` is `MoveFileExW` with
+    // `MOVEFILE_REPLACE_EXISTING` on Windows and replaces the target in one
+    // step. Unlinking beforehand would open a window in which `queue.json`
+    // does not exist at all, and a crash there loses every pending review --
+    // precisely what write-temp-then-rename exists to prevent.
     std::fs::rename(tmp, target)
         .map_err(|e| AppError::Config(format!("cannot replace config: {e}")))?;
     Ok(())
@@ -310,6 +310,41 @@ pub fn write_atomic(tmp: &Path, target: &Path, bytes: &[u8]) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `write_atomic` must replace the target in a single `rename`, with no
+    /// unlink first. On Windows `rename` already replaces an existing file, so
+    /// unlinking only creates a window in which the file does not exist -- and
+    /// a crash there loses `queue.json` entirely.
+    #[test]
+    fn write_atomic_replaces_an_existing_file_in_one_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("queue.json");
+        std::fs::write(&target, b"OLD CONTENT, LONGER THAN THE NEW").unwrap();
+
+        let tmp = dir.path().join("queue.json.tmp");
+        write_atomic(&tmp, &target, b"NEW").expect("replaces");
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW");
+
+        // And no temp file is left behind to be mistaken for real state.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "queue.json")
+            .collect();
+        assert!(strays.is_empty(), "left behind: {strays:?}");
+    }
+
+    /// Writing where nothing exists yet must work too -- the first run has no
+    /// file to replace.
+    #[test]
+    fn write_atomic_creates_a_file_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("state.json");
+        let tmp = dir.path().join("state.json.tmp");
+        write_atomic(&tmp, &target, b"{}").expect("creates");
+        assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+    }
 
     fn filled() -> Config {
         Config {

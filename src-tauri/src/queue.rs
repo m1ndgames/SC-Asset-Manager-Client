@@ -486,12 +486,25 @@ impl Queue {
         self.get(id).ok_or_else(|| missing(id))
     }
 
+    /// Return a failed write to `Approved` so the drain picks it up again.
+    ///
+    /// Refuses a journalled merge for the same reason [`Self::restore`] does:
+    /// the write may have landed before the error was reported, and repeating
+    /// it adds the quantity to the target asset a second time. `Queue::open`
+    /// already promotes such an item rather than retrying it, so letting the
+    /// Retry button do what the crash path refuses to would defeat that.
     pub fn retry(&mut self, id: &str) -> AppResult<&QueueItem> {
         let item = self.item_mut(id)?;
         if item.state != ItemState::Failed {
             return Err(AppError::Queue(format!(
                 "{id} is {:?}, not failed",
                 item.state
+            )));
+        }
+        if item.merge_applied {
+            let target = item.merge_target_id.clone().unwrap_or_default();
+            return Err(AppError::Queue(format!(
+                "{id} was already merged into {target}, so retrying it could add the                  same quantity twice. Check that asset in SC-Asset-Manager and reject                  this item once you have."
             )));
         }
         item.state = ItemState::Approved;

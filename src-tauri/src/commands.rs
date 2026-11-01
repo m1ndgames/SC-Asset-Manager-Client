@@ -186,19 +186,33 @@ pub fn start_watcher(
 
     let offset = match offset {
         Some(o) => o,
-        None => match cold_start_for(&path) {
-            ColdStart::Resume { offset } => offset,
-            // Default to start-from-now, never a silent import.
-            ColdStart::FirstRun { end_offset, .. } => end_offset,
-            ColdStart::Backfill { .. } => watchstate::load().offset,
-            ColdStart::NoLog => 0,
-        },
+        None => offset_for(cold_start_for(&path)),
     };
 
     let handle = watcher_task::start(app, &cfg, path, offset)?;
     let status = handle.status();
     *guard = Some(handle);
     Ok(status)
+}
+
+/// Where to start reading for a cold-start decision, when the caller did not
+/// name an offset.
+///
+/// `Backfill` must start at 0. The saved offset is a byte position in a
+/// *different* file -- the reasons are `Replaced`, `DifferentPath` and
+/// `Truncated` -- so reusing it starts reading at an arbitrary point in the new
+/// log and never sees the trades before it. Re-reading is cheap and safe
+/// instead: `Queue::enqueue` refuses an id already in history and returns the
+/// existing item for one still queued, so a duplicate collapses on the
+/// deterministic id.
+fn offset_for(plan: ColdStart) -> u64 {
+    match plan {
+        ColdStart::Resume { offset } => offset,
+        // Default to start-from-now, never a silent import.
+        ColdStart::FirstRun { end_offset, .. } => end_offset,
+        ColdStart::Backfill { .. } => 0,
+        ColdStart::NoLog => 0,
+    }
 }
 
 /// The cold-start decision, with the trade count filled in only when a first
@@ -371,6 +385,47 @@ pub async fn refresh_refdata(state: State<'_, AppState>) -> AppResult<RefData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Cold-start offsets
+    // -----------------------------------------------------------------------
+
+    /// A backfill must start at 0. The saved offset is a byte position in a
+    /// *different* file, so reusing it starts reading part-way into the new log
+    /// and silently skips every trade before that point. This is reached
+    /// whenever `start_watcher` is called with no offset, which is what
+    /// `autostart_watcher` always does.
+    #[test]
+    fn a_backfill_starts_from_the_beginning_not_a_stale_offset() {
+        for reason in [
+            crate::log::watcher::BackfillReason::Replaced,
+            crate::log::watcher::BackfillReason::DifferentPath,
+            crate::log::watcher::BackfillReason::Truncated,
+        ] {
+            assert_eq!(
+                offset_for(ColdStart::Backfill { reason }),
+                0,
+                "a stale offset from another file must not be reused"
+            );
+        }
+    }
+
+    /// The other three arms, so the fix above cannot be over-applied: a resume
+    /// keeps its offset and a first run defaults to start-from-now rather than
+    /// importing the whole log behind the user's back.
+    #[test]
+    fn the_other_cold_starts_keep_their_offsets() {
+        assert_eq!(offset_for(ColdStart::Resume { offset: 4096 }), 4096);
+        assert_eq!(
+            offset_for(ColdStart::FirstRun {
+                trades: 7,
+                end_offset: 9999,
+            }),
+            9999,
+            "a first run starts from now, never from 0"
+        );
+        assert_eq!(offset_for(ColdStart::NoLog), 0);
+    }
 
     #[test]
     fn parses_a_bare_json_config() {

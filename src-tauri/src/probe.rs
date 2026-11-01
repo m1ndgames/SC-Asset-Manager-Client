@@ -45,8 +45,31 @@ fn has_quality(m: &Option<Map<String, Value>>) -> bool {
     m.as_ref().and_then(|f| f.get("quality")).is_some()
 }
 
+/// Whether the probe commands may run.
+///
+/// `delete_test_asset` deletes any asset by id from the user's live group
+/// database, and `phase1_probe` writes to it. Both exist to settle Firestore's
+/// PATCH semantics against a scratch project during development, and nothing in
+/// `src/` invokes either -- but both are registered in the shipped invoke
+/// handler, so a release build exposes "delete any asset" to anything that can
+/// reach `invoke`. Taking the flag as an argument keeps both branches testable.
+fn probe_allowed_when(is_debug_build: bool) -> Result<(), BackendError> {
+    if is_debug_build {
+        Ok(())
+    } else {
+        Err(BackendError::Other(
+            "the backend probe is available only in development builds".into(),
+        ))
+    }
+}
+
+fn probe_allowed() -> Result<(), BackendError> {
+    probe_allowed_when(cfg!(debug_assertions))
+}
+
 #[tauri::command]
 pub async fn phase1_probe(state: State<'_, AppState>) -> Result<ProbeReport, BackendError> {
+    probe_allowed()?;
     run_probe(&state.config()).await
 }
 
@@ -256,7 +279,34 @@ pub async fn run_probe(cfg: &crate::config::Config) -> Result<ProbeReport, Backe
 /// Remove the probe asset once you have finished poking at it in the web app.
 #[tauri::command]
 pub async fn delete_test_asset(state: State<'_, AppState>, id: String) -> Result<(), BackendError> {
+    probe_allowed()?;
     let cfg = state.config();
     let b = FirebaseBackend::from_config(&cfg)?;
     b.delete_asset(&id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A release build must not expose the probe. `delete_test_asset` deletes
+    /// any asset by id from the user's live group database and nothing in the
+    /// UI calls it, so in a shipped build it is reachable capability with no
+    /// purpose.
+    #[test]
+    fn the_probe_is_refused_in_a_release_build() {
+        let err = probe_allowed_when(false).expect_err("must refuse");
+        assert!(err.to_string().contains("development builds"), "{err}");
+    }
+
+    #[test]
+    fn the_probe_is_allowed_in_a_debug_build() {
+        assert!(probe_allowed_when(true).is_ok());
+    }
+
+    /// Tests run with `debug_assertions`, so the live gate must agree.
+    #[test]
+    fn the_live_gate_follows_the_build_profile() {
+        assert_eq!(probe_allowed().is_ok(), cfg!(debug_assertions));
+    }
 }

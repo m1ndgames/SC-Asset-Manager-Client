@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Current state
 
 **Phases 0-6 and 8 are done**, plus the History view and autostart. What exists
-and passes (259 tests green, clippy clean under `-D warnings`):
+and passes (268 tests green, clippy clean under `-D warnings`):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -223,6 +223,27 @@ filesystem (`backend/mock.rs` stands in for the backend).
   - Persistence order is the **reverse of `retire`**: add to the queue and fsync,
     *then* remove from history. An item in both files is shown twice; an item in
     neither is lost.
+
+- **A journalled merge is refused by `retry` as well as `restore`.** Both
+  `Queue::open` (which promotes rather than retries) and `restore` guard
+  `merge_applied`; `retry` did not, so the Retry button on a failed merged buy
+  was a route to adding the quantity twice — the backend write can land before
+  the error comes back. All three paths now agree. A plain failed write is still
+  retryable, because every non-merge write is an idempotent upsert.
+- **`write_atomic` must not unlink before renaming.** `std::fs::rename` is
+  `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows and replaces the
+  target in one step (verified empirically, not from the docs). An earlier
+  `remove_file` — added on the false premise that Windows rename fails on an
+  existing target — opened a window in which `queue.json` did not exist, and a
+  crash there loses every pending review.
+- **A backfill cold start reads from 0, never the saved offset.** The saved
+  offset is a byte position in a *different* file (`Replaced`, `DifferentPath`,
+  `Truncated`), so reusing it starts part-way into the new log and silently skips
+  everything before that point. Re-reading is safe: `enqueue` refuses an id
+  already in history and returns the existing item for one still queued, so the
+  deterministic id collapses the duplicate. `offset_for` is a pure function so
+  all four arms are tested. Note `log::watcher::backfill` is currently **unused**
+  in production — queue-level dedupe does that job.
 
 - **Firestore document id and the record's `id` field must be identical.** A mismatch
   produces a record the web app can display but never update or delete. Guard it at
@@ -542,6 +563,32 @@ What *is* tested is the naming, and that is deliberate:
   since an asset of unknown unit cannot be merged or sold against. It needs one
   existing record to infer from and reports nothing on an empty collection rather
   than warning falsely.
+
+## Open findings from the Nov 2026 review
+
+A full review of the branch turned up twelve issues. The three high-severity ones
+and the exposed probe command are fixed (see the invariants above and
+`probe_allowed_when`). These eight are **known and unfixed** — don't rediscover
+them, and don't assume they are deliberate:
+
+| Where | Issue |
+|---|---|
+| `commands.rs` `get_history` | CSV export and History totals are silently capped at **200 records**. `export_history_csv` passes `None`, which `get_history` turns into `take(200)`. A user with 500 rows exports 200 and is told "Exported 200 records". |
+| `drain.rs` `WrittenSummary::from_buy` | A **merged** buy is reported as "written as a separate asset", with `o.asset`'s id and the delta rather than the target id and merged total. `o.merged` is never consulted. The user is told the opposite of what happened. |
+| `commands.rs` + `History.svelte` + `ReviewCard.svelte` | **Item-name precedence is inverted.** `QueueItem::item_name` is `edits.item_name.or(resolved)` — the override is what gets written — but every display path does `resolved.or(edits.item_name)`. A corrected name is written to the database while the card, the History table, its search filter and the CSV all show the resolved one. |
+| `log/watcher.rs` ~320 | After a rotation the safe-offset floor is taken from the **old** file's position (`offset_before_batch`), and is persisted beside the new file's identity. A tick carrying both a rotation and a trade line can write a far-too-large offset, which the next launch then `Resume`s past. |
+| `backend/pocketbase.rs` `asset_from_pb` | An **empty** `app_id` is accepted (only absent is rejected), yielding an `AssetRecord` with `id: ""`. It can then be picked as a sell or merge target, after which every id-based call fails the uuid parse. |
+| `backend/pocketbase.rs` | A PocketBase `PATCH` **cannot delete fields**, so an orphan trade keeps stale `buyPrice`/`buyUnit`/`buyLocation`. The Firestore path handles this deliberately via `updateMask`; PocketBase needs explicit nulls. |
+| `commands.rs` `cold_start_for` | The first-run trade count scans with `hold_ms = 0`, and `scan` requires `d >= 0 && d <= hold_ms`, so a failed trade is never discarded and is counted as real. Contradicts `ColdStart::Backfill`'s own doc comment. |
+| `suggestions.svelte.ts` `recentLocations` | Not actually recency-ordered: it reverses `Object.values` (insertion order by `shopId`), and re-`remember`ing an existing shopId leaves its key in place. The place just used can fall outside `slice(0, 4)`. |
+
+The review found nothing to fault in `parse.rs`, `ids.rs`, `units.rs`, `value.rs`,
+`tail.rs`'s offset/partial-line handling, the Firestore update-mask strategy, or
+the sell-ordering rules.
+
+Three of the twelve (the backfill offset, the rotation floor, the first-run
+count) are in the **cold-start/rotation path**, which is where the real bugs
+clustered and is the least covered by tests. Treat changes there with suspicion.
 
 ## Log rotation
 
