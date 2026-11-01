@@ -157,7 +157,7 @@ impl Config {
     }
 }
 
-/// The config as the webview sees it. Note the absence of `password`.
+/// The config as the webview sees it. Carries no `password`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigDto {

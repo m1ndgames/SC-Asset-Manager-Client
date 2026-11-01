@@ -1,15 +1,11 @@
 //! Tests for the PocketBase mapping.
 //!
-//! These are deliberately weighted towards the *names* of things rather than
-//! the HTTP plumbing. PocketBase silently discards a field it has no column
-//! for, so a casing slip does not fail a write — it writes a record with the
-//! field missing and returns 200. That failure mode cannot be caught by
-//! anything except asserting the key set against the documented schema, which
-//! is what most of this file does.
+//! Weighted towards names rather than HTTP plumbing: PocketBase discards a
+//! field it has no column for and returns 200, so a casing slip writes a
+//! record with the field missing. Asserting the key set against the documented
+//! schema is the only way to catch that.
 //!
-//! The wire behaviour (PATCH-then-POST, pagination, the auth handshake) needs
-//! a live instance and is covered by `tests/live_pocketbase.rs`, which is
-//! `#[ignore]`d.
+//! The wire behaviour needs a live instance — see `tests/live_pocketbase.rs`.
 
 use super::*;
 use crate::units::CargoUnit;
@@ -24,9 +20,8 @@ fn cfg() -> Config {
     c
 }
 
-/// A uuid whose first character is a letter, so `to_pb_id` does not prefix it.
-/// Most real ids are not like this -- of the two published vectors, both begin
-/// with a digit -- which is why the prefixed case has a test of its own below.
+/// A uuid starting with a letter, so `to_pb_id` does not prefix it. Both
+/// published vectors begin with a digit, so the prefixed case is tested below.
 const UUID: &str = "ea78052a-11b2-484e-a7ee-d19ed906a037";
 const PB_ID: &str = "ea78052a11b2484ea7eed19ed906a037";
 
@@ -146,7 +141,7 @@ const TRADE_COLUMNS: &[&str] = &[
     "source",
 ];
 
-/// The one that matters. Anything we send that is not a column is dropped
+/// Anything we send that is not a column is dropped
 /// without an error, so every emitted key must be a known column.
 #[test]
 fn no_asset_field_is_sent_that_pocketbase_has_no_column_for() {

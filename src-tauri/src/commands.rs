@@ -361,7 +361,7 @@ pub async fn refresh_refdata(state: State<'_, AppState>) -> AppResult<RefData> {
     let url = state.config().app_url;
     let fetched = refdata::fetch(&url).await?;
     if let Err(e) = refdata::save(&fetched) {
-        // Worth saying, not worth failing: it is in memory and working.
+        // Not worth failing: it is in memory and working.
         tracing::warn!(error = %e, "fetched reference data but could not cache it");
     }
     *state.refdata.write().unwrap() = fetched.clone();

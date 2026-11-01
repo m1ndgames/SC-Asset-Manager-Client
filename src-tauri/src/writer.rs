@@ -1,30 +1,14 @@
 //! Turning an approved queue item into backend writes.
 //!
-//! This module implements INTEGRATIONS.md §8 **once**, for both backends. It
-//! takes a `&dyn SyncBackend` and knows nothing about Firestore or PocketBase —
-//! the ordering rules are the valuable part and they must not be duplicated per
-//! backend, because a rule implemented twice is a rule that will diverge.
+//! Implements INTEGRATIONS.md §8 once, for both backends, against
+//! `&dyn SyncBackend`. The ordering rules are the valuable part; a rule
+//! implemented per-backend is a rule that will diverge.
 //!
-//! ## Phase 3 scope: one asset per log line
-//!
-//! The §8 merge rule — add to an existing asset with the same item and location
-//! — is deliberately *not* implemented here yet. It is the one non-idempotent
-//! operation in the whole design, so it gets its own phase and its own guard.
-//!
-//! This is not a gap in the contract: §8 explicitly offers the choice, "If you
-//! would rather have strict replay safety than a tidy inventory, write one asset
-//! per log line instead and let the user merge in the app." That is exactly what
-//! this does, and it is the safer half of the trade-off. [`merge_candidates`]
-//! exists so the UI can tell the user when the app would have merged, rather
-//! than silently producing a second row.
-//!
-//! ## What a buy writes
-//!
-//! A buy creates an `Asset` and **no trade record** (§8). The id is the
-//! deterministic trade id, which is also the document id — a mismatch there
-//! produces a record the web app can display but never update or delete, so
-//! [`build_asset`] is the one place that decides it and the backend derives the
-//! document id from `record.id` rather than being passed one separately.
+//! A buy writes an `Asset` and no trade record. Its id is the deterministic
+//! trade id, which is also the document id — a mismatch yields a record the
+//! web app can display but never update or delete, so [`build_asset`] is the
+//! single place that decides it and the backend derives the document id from
+//! `record.id`.
 
 use crate::backend::{BackendError, BackendResult, SyncBackend};
 use crate::model::{now_iso, AssetRecord, TradeRecord, SOURCE};
@@ -169,19 +153,13 @@ where
         });
     };
 
-    // ---- From here on the operation is NOT idempotent. ----
-    //
-    // Adding to an existing amount cannot be repeated safely: a second attempt
-    // adds the quantity again. So the intent is journalled to `queue.json`
-    // *before* the backend is touched, and `Queue::open` treats a `Writing`
-    // item with `merge_applied` as `Written` rather than retrying it. That
-    // trades a possible missed merge (recoverable, visible in the web app) for
-    // an impossible double-count (silent, and corrupts the shared inventory).
-    //
-    // `record_merge` is a parameter rather than something this function does
-    // itself because `writer.rs` must stay backend- and queue-agnostic. Making
-    // it an argument means no caller can reach the non-idempotent path without
-    // having said what to do about the journal.
+    // From here on the operation is NOT idempotent: a second attempt adds the
+    // quantity again. The intent is journalled to `queue.json` before the
+    // backend is touched, and `Queue::open` treats a `Writing` item with
+    // `merge_applied` as `Written` rather than retrying it — trading a possible
+    // missed merge (recoverable, visible in the web app) for an impossible
+    // double-count. `record_merge` is a parameter so no caller can reach this
+    // path without having said what to do about the journal.
     record_merge(&plan)?;
 
     let target = backend.get_asset(&plan.target_id).await?.ok_or_else(|| {
@@ -267,22 +245,16 @@ fn choose_asset(mut candidates: Vec<AssetRecord>) -> Option<(AssetRecord, Vec<St
 
 /// Write an approved sell.
 ///
-/// ## Ordering
+/// The trade is written first, then the asset is mutated (§8). There is no
+/// transaction, and the failure modes are asymmetric: a trade whose asset was
+/// not decremented is a visible discrepancy the user can correct, while a
+/// decremented asset with no trade is cargo that silently evaporated.
 ///
-/// **The trade is written first, then the asset is mutated.** There is no
-/// transaction, so one of the two happens first, and the failure modes are not
-/// symmetric: a trade whose asset was not decremented is a visible discrepancy
-/// the user can correct, whereas a decremented asset with no trade is cargo
-/// that silently evaporated. §8 mandates this order.
-///
-/// ## Why the trade is denominated in the *asset's* unit
-///
-/// The web app computes profit as `(sellPrice - buyPrice) * amountSold` with
-/// **no unit conversion**, so a trade where `unit != buyUnit` displays a wrong
-/// number. `buyPrice` and `buyUnit` necessarily come from the asset, so the
-/// only way to guarantee the two agree is to express the sell side in the
-/// asset's unit as well. This client writes SCU, but the web app may have
-/// written an asset in cSCU, and that must not silently produce a wrong profit.
+/// The trade is denominated in the *asset's* unit. The web app computes
+/// `(sellPrice - buyPrice) * amountSold` with no unit conversion, so a trade
+/// where `unit != buyUnit` shows a wrong profit. `buyPrice`/`buyUnit` come from
+/// the asset, so the sell side has to match it — this client writes SCU, but
+/// the web app may have written the asset in cSCU.
 pub async fn write_sell(
     backend: &dyn SyncBackend,
     item: &QueueItem,

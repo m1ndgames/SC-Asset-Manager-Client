@@ -3,7 +3,7 @@
 
   It holds no queue state of its own. Every action calls a command and this
   refetches — the queue lives in Rust and Svelte renders a projection of it.
-  That is why there is no reconciliation logic and no "unsaved edits" anywhere.
+  So there is no reconciliation logic and no "unsaved edits" anywhere.
 -->
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";

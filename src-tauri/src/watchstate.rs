@@ -83,7 +83,7 @@ impl WatchState {
     /// Does this record describe the file now at `path`?
     ///
     /// An unanswerable comparison is not a mismatch — it means the caller must
-    /// fall back to length. Note the asymmetry with creation time: it is only
+    /// fall back to length. Creation time is only
     /// consulted when neither side has a header, because NTFS tunneling makes
     /// a *matching* creation time meaningless, while a differing one is still
     /// conclusive.

@@ -59,7 +59,7 @@ impl CargoBoxGroup {
 
 /// Whether `sum(boxSize_i * unitAmount_i) == quantity` on this line.
 ///
-/// This is the project's early-warning system for log-format drift, so its
+/// The early-warning system for log-format drift, so its
 /// false-positive rate matters: a check that cries wolf trains the user to
 /// ignore amber and stops being a signal at all.
 ///

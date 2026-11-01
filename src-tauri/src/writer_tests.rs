@@ -594,7 +594,7 @@ async fn the_trade_is_denominated_in_the_assets_unit() {
 }
 
 /// If the trade cannot be written, the asset must be left completely alone.
-/// This is the half of the ordering rule that a happy-path test cannot show.
+/// The half of the ordering rule a happy-path test cannot show.
 #[tokio::test]
 async fn a_failed_trade_write_leaves_the_asset_untouched() {
     let (_d, item) = approved(SELL, "Baijini Point");

@@ -95,7 +95,7 @@ export function watcherChip(): Chip {
     };
   }
   if (w.pending > 0) {
-    // Worth surfacing: it means a detection is mid-grace-window right now.
+    // A detection is mid-grace-window right now.
     return {
       label: `Watcher: ${w.pending} in grace`,
       tone: "ok",

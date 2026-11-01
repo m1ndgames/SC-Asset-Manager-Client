@@ -1,10 +1,9 @@
 //! The update check.
 //!
-//! This lives in Rust rather than calling `@tauri-apps/plugin-updater` from
-//! Svelte, for the same reason everything else does: the webview makes zero
-//! outbound requests, which is what keeps the CSP at `default-src 'self'`.
-//! Using the JS API here would mean the renderer fetching the manifest and the
-//! installer, and the CSP would have to be opened up to GitHub to allow it.
+//! In Rust rather than via `@tauri-apps/plugin-updater`, because the webview
+//! makes no outbound requests — that is what keeps the CSP at
+//! `default-src 'self'`. Using the JS API would mean the renderer fetching the
+//! manifest and installer, forcing the CSP open to GitHub.
 //!
 //! Nothing checks automatically. The user asks, in Settings.
 
@@ -85,12 +84,10 @@ pub async fn check_for_update(app: AppHandle) -> AppResult<UpdateInfo> {
 
 /// Download and install, then relaunch.
 ///
-/// The queue is safe across this: every transition is fsynced to `queue.json`
-/// before the next one, and a journalled merge is promoted to `Written` on
-/// reopen rather than retried. So an install that interrupts a write is
-/// recoverable by the same machinery that handles a crash. What is *not*
-/// recoverable is losing the user's attention mid-review, so this refuses
-/// while anything is actually being written.
+/// An interrupted write is recoverable by the same machinery that handles a
+/// crash, since every transition is fsynced and a journalled merge is promoted
+/// to `Written` on reopen. Even so this refuses while anything is waiting to be
+/// written, because losing a part-finished review is not recoverable.
 #[tauri::command]
 pub async fn install_update(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     let writing = {
@@ -152,9 +149,7 @@ pub async fn install_update(app: AppHandle, state: State<'_, AppState>) -> AppRe
 #[cfg(test)]
 mod tests {
 
-    /// The version the updater compares against must be the one in
-    /// `tauri.conf.json`, not a string duplicated somewhere in Rust. If these
-    /// ever diverge, an update either never offers or offers forever.
+    /// If these diverge, an update either never offers or offers forever.
     #[test]
     fn the_crate_version_matches_the_bundle_version() {
         let conf: serde_json::Value =
@@ -166,12 +161,10 @@ mod tests {
         );
     }
 
-    /// `requireSignedVersion` must stay on. It is the only guard against a
-    /// crafted manifest pairing a new version number with the `url` and
-    /// signature of an older, genuinely signed release — a forced downgrade to
-    /// a build whose bugs are known. Turning it on later is not equivalent:
-    /// until it is on, that attack works, and once releases exist they all
-    /// have to be re-signed.
+    /// `requireSignedVersion` must stay on: it is the only guard against a
+    /// crafted manifest pairing a new version with the signature of an older,
+    /// genuinely signed release. Turning it on later is not equivalent — until
+    /// it is on the attack works, and existing releases would need re-signing.
     #[test]
     fn signed_versions_are_required() {
         let conf: serde_json::Value =
@@ -183,11 +176,9 @@ mod tests {
         );
     }
 
-    /// Updater artifacts are not produced by default, and nothing about a
-    /// build without them looks wrong: the installers come out fine, the
-    /// signing secrets are accepted, and `latest.json` is written pointing at
-    /// files that were never created. The updater is then dead on arrival for
-    /// every copy installed from that release.
+    /// Updater artifacts are off by default, and a build without them looks
+    /// fine: installers are produced, signing secrets are accepted, and
+    /// `latest.json` points at files that were never created.
     #[test]
     fn updater_artifacts_are_produced() {
         let conf: serde_json::Value =
@@ -199,9 +190,8 @@ mod tests {
         );
     }
 
-    /// The pubkey must be present and must be the raw contents of the `.key.pub`
-    /// file, which is already base64. Encoding it twice produces a key that
-    /// parses but verifies nothing.
+    /// The pubkey is the `.key.pub` file's contents verbatim — already base64.
+    /// Encoding it twice produces a key that parses but verifies nothing.
     #[test]
     fn the_update_pubkey_is_configured() {
         let conf: serde_json::Value =
@@ -218,8 +208,7 @@ mod tests {
         );
     }
 
-    /// A tiny decoder, so this test does not pull in a base64 crate the app
-    /// does not otherwise need.
+    /// Avoids pulling in a base64 crate the app does not otherwise need.
     fn base64_decode(s: &str) -> Option<Vec<u8>> {
         const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut acc: u32 = 0;

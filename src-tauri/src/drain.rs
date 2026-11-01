@@ -5,23 +5,16 @@
 //! and the events. Keeping them apart is what lets the contract be tested with
 //! no runtime at all.
 //!
-//! ## The lock rule
+//! The queue's mutex guard is never held across an `.await`: each iteration
+//! takes the lock, claims one item, releases it, does the network call, then
+//! takes it again to record the result. Holding it would serialise the UI
+//! behind a network timeout (and a `std::sync` guard is not `Send`, so it does
+//! not compile either).
 //!
-//! The queue lives behind a `std::sync::Mutex` and its guard is **never held
-//! across an `.await`**. Each iteration takes the lock, claims one item,
-//! releases it, does the network call, then takes it again to record the
-//! result. Holding it across the await would serialise the whole UI behind a
-//! network timeout, and a `std::sync` guard is not `Send` so it would not even
-//! compile — which is a useful accident.
-//!
-//! ## Why a drain rather than a background worker
-//!
-//! It runs on startup and after each approval, which covers every way an item
-//! can reach `Approved`. A permanently-running worker would need its own
-//! wake-up channel and shutdown handling to achieve exactly the same thing.
-//! Startup matters because `Approved` survives a restart: PLAN.md §6 requires
-//! the writer to drain those before processing anything new, which is safe
-//! precisely because every write is an idempotent upsert on a deterministic id.
+//! A drain rather than a background worker: it runs on startup and after each
+//! approval, which covers every way an item reaches `Approved`. Startup matters
+//! because `Approved` survives a restart, and draining those first is safe
+//! because every write is an idempotent upsert on a deterministic id.
 
 use tauri::{AppHandle, Emitter, Manager};
 

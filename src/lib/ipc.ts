@@ -109,7 +109,6 @@ export interface PocketbaseConfig {
   url: string;
 }
 
-/** Note the absence of `password` — it never crosses into the webview. */
 export interface ConfigDto {
   schema: number;
   nickname: string;
@@ -391,9 +390,8 @@ export const getHistory = (limit?: number): Promise<ItemView[]> =>
 /**
  * Put a rejected or discarded trade back into the review queue.
  *
- * Rust refuses a written or merged item: repeating those writes corrupts data
- * rather than duplicating it. Expect an `AppError` of kind `queue` for those,
- * and show its message — it says what to do instead.
+ * Rust refuses a written or merged item with an `AppError` of kind `queue`;
+ * show its message, which says what to do instead.
  */
 export const restoreItem = (id: string): Promise<ItemView> =>
   invoke("restore_item", { id });
@@ -444,11 +442,7 @@ export interface UpdateProgress {
   done: boolean;
 }
 
-/**
- * Both of these run in Rust rather than through
- * `@tauri-apps/plugin-updater`, because the webview makes no outbound
- * requests — that is what keeps the CSP at `default-src 'self'`.
- */
+/** In Rust, not `@tauri-apps/plugin-updater`: the webview makes no requests. */
 export const checkForUpdate = (): Promise<UpdateInfo> =>
   invoke("check_for_update");
 

@@ -1,29 +1,20 @@
 //! The PocketBase backend.
 //!
-//! Schema and rules come from POCKETBASE.md in the main repo; ids and the
-//! field contract from INTEGRATIONS.md. Three things differ from Firestore in
-//! ways that are easy to get wrong by analogy:
+//! Schema from POCKETBASE.md, field contract from INTEGRATIONS.md. Three things
+//! differ from Firestore in ways that are easy to get wrong by analogy:
 //!
-//! 1. **The id is split in two.** PocketBase cannot hold a hyphenated UUID as
-//!    a primary key, so a record carries `id = to_pb_id(uuid)` (hyphens
-//!    stripped, `r`-prefixed when it would otherwise start with a digit) *and*
-//!    `app_id = uuid`. Readers prefer `app_id`. `to_pb_id` is not reversible,
-//!    because the prefix is conditional — which is precisely why `app_id`
-//!    exists and why both are always written.
+//! 1. **The id is split in two.** PocketBase cannot hold a hyphenated UUID as a
+//!    primary key, so a record carries `id = to_pb_id(uuid)` *and*
+//!    `app_id = uuid`. Readers prefer `app_id`; `to_pb_id` is not reversible
+//!    because the `r` prefix is conditional, which is why both are written.
+//! 2. **`app_id` is the only snake_case name in the schema**, everything else
+//!    camelCase as Firestore. PocketBase answers a write containing an unknown
+//!    field with 200 and discards the field, so a casing slip does not fail —
+//!    it stops recording data. Hence the field-by-field mapping tests.
+//! 3. **The token has no `Bearer` prefix** (INTEGRATIONS.md §1).
 //!
-//! 2. **`app_id` is the only snake_case name in the schema.** Everything else
-//!    is camelCase, exactly as Firestore: `buyPrice`, `createdAt`,
-//!    `amountSold`, `sellLocation`. PocketBase *silently discards* a field it
-//!    has no column for, so a casing slip here does not fail — it quietly
-//!    stops recording data. That is the single most dangerous property of this
-//!    backend and the reason the mapping is tested field by field.
-//!
-//! 3. **The token has no `Bearer` prefix.** INTEGRATIONS.md is explicit:
-//!    `Authorization: <token>`.
-//!
-//! There is no upsert verb, so a write is `PATCH`, falling back to `POST` on a
-//! 404. That keeps the operation idempotent on a deterministic id, which is
-//! what the whole queue design rests on.
+//! There is no upsert verb, so a write is `PATCH` falling back to `POST` on a
+//! 404, keeping it idempotent on a deterministic id.
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -89,9 +80,9 @@ impl PocketbaseBackend {
 
     /// A valid token, signing in again when it is close to expiring.
     ///
-    /// PocketBase does have an `auth-refresh` endpoint, but re-authenticating
-    /// is one request either way and avoids a second code path that is only
-    /// exercised after a long idle — the kind that breaks unnoticed.
+    /// PocketBase has an `auth-refresh` endpoint, but re-authenticating costs
+    /// one request either way and avoids a code path only exercised after a
+    /// long idle.
     async fn token(&self) -> BackendResult<String> {
         if let Some(s) = self.session.lock().unwrap().as_ref() {
             if !s.needs_refresh() {
@@ -117,9 +108,8 @@ impl PocketbaseBackend {
 
     /// `PATCH`, falling back to `POST` when the record does not exist yet.
     ///
-    /// PocketBase has no upsert. Trying the update first means the common case
-    /// — a retry of a write that already landed — costs one request, and the
-    /// operation stays idempotent on the deterministic id.
+    /// Trying the update first means the common case — a retry of a write that
+    /// already landed — costs one request.
     async fn upsert(&self, collection: &str, fields: Map<String, Value>) -> BackendResult<()> {
         let pb_id = fields
             .get("id")
@@ -158,9 +148,6 @@ impl PocketbaseBackend {
     }
 
     /// Every record in a collection, following pagination.
-    ///
-    /// Like the Firestore backend this fetches and filters client-side where a
-    /// filter would otherwise have to be trusted; the collections are small.
     async fn list(&self, collection: &str, filter: Option<&str>) -> BackendResult<Vec<Value>> {
         let mut out = Vec::new();
         let mut page = 1;
@@ -204,9 +191,8 @@ impl PocketbaseBackend {
 
 /// Percent-encode a PocketBase filter expression for a query string.
 ///
-/// Deliberately conservative — anything not unreserved is escaped — because a
-/// filter contains quotes, parentheses, `=` and spaces, and a half-escaped one
-/// silently matches the wrong rows rather than erroring.
+/// Escapes anything not unreserved: a half-escaped filter silently matches the
+/// wrong rows rather than erroring.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.as_bytes() {
@@ -225,24 +211,19 @@ fn filter_literal(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// Columns that POCKETBASE.md says were added after the first release, and so
-/// may be missing on an instance that was set up early.
-///
-/// This matters because PocketBase answers a write containing an unknown field
-/// with 200 and silently drops the field. Losing `unit` is not cosmetic: an
-/// asset whose unit is unknown cannot be merged or sold against correctly.
+/// Columns POCKETBASE.md says were added after the first release, so they may
+/// be missing on an early instance. Losing `unit` is not cosmetic: an asset of
+/// unknown unit cannot be merged or sold against correctly.
 const LATE_ASSET_COLUMNS: &[&str] = &["unit", "quality", "source"];
 const LATE_TRADE_COLUMNS: &[&str] = &["unit", "buyUnit", "source"];
 
 /// Detect a missing column from a returned record.
 ///
-/// PocketBase returns *every* column of a record, including the ones that are
-/// unset — an empty Text comes back as `""`, an unset Number as `0`. So a key
-/// that is absent from a record means the collection has no such column, which
-/// is the only cheap way to see this without an admin token.
-///
-/// It needs at least one existing record to look at; with an empty collection
-/// there is nothing to infer from, and it reports nothing rather than guessing.
+/// PocketBase returns every column including unset ones (`""` for Text, `0` for
+/// Number), so a key absent from a record means the collection has no such
+/// column — the only cheap way to see this without an admin token. Needs one
+/// existing record; reports nothing for an empty collection rather than
+/// guessing.
 fn missing_columns(rows: &[Value], expected: &[&str]) -> Vec<String> {
     let Some(obj) = rows.first().and_then(Value::as_object) else {
         return Vec::new();
@@ -271,10 +252,8 @@ async fn pb_error(what: &str, res: reqwest::Response) -> BackendError {
     }
 }
 
-/// Turn a record into the PocketBase body: the app's `id` becomes `app_id`,
-/// and `id` becomes the mangled primary key.
-///
-/// Both are always written. §6: "Always write both fields."
+/// Turn a record into the PocketBase body: the app's `id` becomes `app_id`, and
+/// `id` becomes the mangled primary key. §6 requires both.
 fn to_pb_fields<T: serde::Serialize>(record: &T, app_id: &str) -> BackendResult<Map<String, Value>> {
     let Value::Object(mut map) = serde_json::to_value(record)
         .map_err(|e| BackendError::Other(e.to_string()))?

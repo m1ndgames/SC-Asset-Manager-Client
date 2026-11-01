@@ -11,21 +11,13 @@
 //! has not advanced past its line yet. A crash there re-reads the line; a crash
 //! after enqueueing is covered by `queue.json`.
 //!
-//! ## Why every mutator writes to disk
+//! Every mutator persists before returning, per PLAN.md §6 — after every
+//! transition and every user field edit. The watcher's offset advances once an
+//! item is enqueued, so anything not on disk at that moment is gone.
 //!
-//! Persistence is not a separate step the caller may forget — each mutator
-//! persists before returning. PLAN.md §6 requires it after every transition
-//! *and* every user field edit, and the reason is the interaction with the
-//! watcher's offset: the offset advances once an item is enqueued, so anything
-//! not on disk at that moment is simply gone. Making it structural costs one
-//! `fsync` per keystroke-batch and removes a whole class of bug.
-//!
-//! ## Why the frontend holds no state
-//!
-//! Svelte calls a command and re-renders from the returned projection. It never
-//! mutates an item locally. That is why this codebase has no reconciliation
-//! logic and no "unsaved edits" concept — there is exactly one copy of the
-//! truth, and it is this one. Preserve that property.
+//! Svelte calls a command and re-renders from the returned projection, never
+//! mutating locally. Hence no reconciliation logic and no "unsaved edits"
+//! concept; preserve that.
 
 use std::path::{Path, PathBuf};
 
@@ -462,17 +454,13 @@ impl Queue {
     /// Journal that a merge is about to be attempted, and fsync before
     /// returning.
     ///
-    /// This is the crash guard for the only non-idempotent operation in the
-    /// design. It must be called *before* the backend is touched, because the
-    /// dangerous window is "the merge landed but we never recorded it" — a
-    /// resumed item would then add the same quantity a second time, silently,
-    /// into a shared inventory.
-    ///
-    /// Recording it first makes the opposite failure the possible one: we
-    /// believe a merge applied when it did not. That costs a missing buy,
-    /// which is visible in the web app and correctable by hand, and is the
-    /// side to err on. `Queue::open` reads `merge_applied` and promotes a
-    /// `Writing` item straight to `Written` rather than retrying it.
+    /// Must be called *before* the backend is touched: the dangerous window is
+    /// "the merge landed but we never recorded it", where a resumed item adds
+    /// the same quantity again into a shared inventory. Recording first makes
+    /// the opposite failure the possible one — believing a merge applied when
+    /// it did not, which costs a missing buy that is visible and correctable by
+    /// hand. `Queue::open` promotes a `Writing` item with `merge_applied`
+    /// straight to `Written` rather than retrying it.
     pub fn mark_merging(&mut self, id: &str, target_id: &str) -> AppResult<()> {
         let item = self.item_mut(id)?;
         item.merge_target_id = Some(target_id.to_string());
@@ -515,24 +503,18 @@ impl Queue {
 
     /// Bring a retired item back into review.
     ///
-    /// This is the one path that moves an item *out* of history, so it is also
-    /// the one place a write could be made to happen twice. Hence the refusals
-    /// below: they are not defensiveness, they are the difference between a
-    /// second write being a harmless upsert and it corrupting the user's data.
+    /// The only path that moves an item out of history, so the only place a
+    /// write could be made to happen twice. Two refusals:
     ///
-    /// - A **written** item stays written. Re-writing a sell would decrement
-    ///   the asset a second time, and re-writing a merged buy would add the
-    ///   quantity again; neither is recoverable from inside this app. A plain
-    ///   buy would in fact be a harmless idempotent upsert, but the user has no
-    ///   way to tell those three cases apart from the History row, so this
-    ///   refuses all of them rather than offering an action that is safe only
-    ///   sometimes.
-    /// - A **journalled merge** is refused whatever its state, because
-    ///   `merge_applied` means the non-idempotent write may already have
-    ///   landed.
+    /// - A **written** item stays written. Re-writing a sell decrements the
+    ///   asset again and re-writing a merged buy adds the quantity again. A
+    ///   plain buy would be a harmless upsert, but a History row does not say
+    ///   which of the three it is, so all three are refused.
+    /// - **`merge_applied`** is refused in any state: the non-idempotent write
+    ///   may already have landed.
     ///
-    /// What is left is exactly the recoverable cases: a rejection the user
-    /// regrets, and a discard the grace window got wrong.
+    /// What remains is the recoverable cases — a rejection the user regrets,
+    /// and a discard the grace window got wrong.
     pub fn restore(&mut self, id: &str) -> AppResult<&QueueItem> {
         let Some(pos) = self.history.iter().position(|i| i.id == id) else {
             // Already back in the queue is not a failure worth an error page.

@@ -33,17 +33,11 @@
   let filter = $state<"all" | "written" | "notWritten">("all");
   let query = $state("");
 
-  // Restoring. A discard came from the game's own failure line, so that one
-  // asks twice; a rejection was just the user changing their mind.
+  // A discard came from the game's own failure line, so it asks twice.
   let restoring = $state<string | null>(null);
   let confirmDiscard = $state<string | null>(null);
 
-  /**
-   * Whether a row can go back for review.
-   *
-   * Written and merged rows are refused in Rust too — this only decides
-   * whether to offer the button, and the real guard is `Queue::restore`.
-   */
+  /** Only decides whether to offer the button; `Queue::restore` is the guard. */
   function canRestore(i: ItemView): boolean {
     if (i.mergeApplied) return false;
     return i.state === "rejected" || i.state === "discarded";
