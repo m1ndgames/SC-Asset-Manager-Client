@@ -46,7 +46,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVBM0Q2OUEwMkYzODdFRUUKUldUdWZqZ3ZvR2s5V3ZxZVUxeExTY1BGV2hJRjdkcjBOVmdUUDViSUVMVVNBcXBvQkhRakxXR0cK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM5RTcwN0RBNzA4QUE3RTgKUldUb3A0cHcyZ2ZueWZrZkJLVm5pUVJFSnpITFd2SmlUamFwUnpua20yQjhFUlczdVl6MTdpemoK",
       "endpoints": [
         "https://github.com/m1ndgames/SC-Asset-Manager-Client/releases/latest/download/latest.json"
       ],

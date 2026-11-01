@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Phases 0, 1 and 2 are done.** What exists and passes (149 tests green, clippy clean):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
-  self-hosted, four-tab shell, updater keypair generated and `pubkey` wired in.
+  self-hosted, four-tab shell, updater keypair generated (password-protected) and
+  `pubkey` wired in.
 - The pure core: `ids.rs`, `units.rs`, `log/parse.rs`, `log/scan.rs`, `log/discover.rs`,
   including both published UUIDv5 vectors and a corpus suite over 11 real sessions.
 - `config.rs` (password never crosses into the webview), `backend/firebase.rs` +
@@ -204,6 +205,32 @@ over an OS keyring. It must be stored nowhere else: **never** returned to the we
 tracing layer), never in an error message. Tokens stay in memory only.
 
 Manual testing goes against a scratch Firebase project, never a live group database.
+
+### Release signing
+
+The updater keypair lives at `C:\Users\<user>\.tauri\sc-asset-manager-client.key`
+and is **password-protected**. It is outside the repo and must stay there; only the
+public half belongs in `tauri.conf.json` under `plugins.updater.pubkey`, stored as the
+`.key.pub` file's contents verbatim — that file is already base64, so do not encode it
+again.
+
+A release build therefore needs both:
+
+```bash
+TAURI_SIGNING_PRIVATE_KEY=<contents of the .key file, or its path>
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD=<the password>
+```
+
+Without them `npm run tauri build` produces no updater artifacts.
+
+**If the password is lost after a release ships, every installed copy becomes
+permanently un-updatable** — the updater verifies against the baked-in public key and
+there is no recovery path short of asking users to reinstall by hand. Rotating the key
+means a new `pubkey`, which only helps versions released *after* the swap.
+
+`tauri signer sign` also takes `--app-version`, which binds a signature to a version;
+an updater configured with `requireSignedVersion` rejects signatures made without it.
+Worth settling in Phase 8 rather than at the first release.
 
 ## UI conventions
 
