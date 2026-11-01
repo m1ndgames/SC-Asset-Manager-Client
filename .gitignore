@@ -1,0 +1,23 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+
+# Rust / Tauri build output. Cargo.lock IS committed (PLAN.md risk #9).
+src-tauri/target/
+src-tauri/gen/
+
+# Updater signing key. The PUBLIC key belongs in tauri.conf.json; the private
+# key must never be committed — it lives in a password manager and in the
+# GitHub Actions secret TAURI_SIGNING_PRIVATE_KEY.
+*.key
+src-tauri/*.key
+
+# Local credentials. The real config lives in
+# %APPDATA%\sc-asset-manager-client\config.toml and holds the backend password
+# in cleartext; nothing resembling it should ever enter the repo.
+config.toml
+*.secrets.json
+
+.idea/
+.vscode/

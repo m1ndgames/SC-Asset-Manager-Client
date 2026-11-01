@@ -1,0 +1,61 @@
+[package]
+name = "sc-asset-manager-client"
+version = "0.1.0"
+description = "Trade parsing from Game.log, with review, for SC-Asset-Manager"
+authors = ["m1nd"]
+edition = "2021"
+rust-version = "1.82"
+
+[lib]
+# Tauri 2 puts the app in a lib so the desktop and (future) mobile entry points
+# can share it. The `_lib` suffix avoids colliding with the binary name.
+name = "sc_asset_manager_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+# Pinned loosely on purpose, with Cargo.lock committed — PLAN.md risk #9.
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2.8"
+# Two tailers would double-write. A second launch must focus the existing window.
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-updater = "2.14"
+
+tokio = { version = "1.54", features = ["rt-multi-thread", "fs", "time", "sync", "macros"] }
+# rustls with bundled roots, not the platform TLS stack: keeps OpenSSL/schannel
+# and Windows cert-store variance out of the picture entirely.
+# NOTE: 0.13 renamed the 0.12 feature `rustls-tls` to `rustls`.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+
+uuid = { version = "1.29", features = ["v5"] }
+# to_rfc3339_opts(SecondsFormat::Millis, true) reproduces exactly what JS
+# `new Date().toISOString()` writes in the web app. That symmetry is the whole
+# reason to prefer chrono over `time`.
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.13"
+
+# Required for Box<dyn SyncBackend> — native async-in-trait isn't dyn-safe.
+async-trait = "0.1"
+# Typed, serialisable errors. No anyhow: commands must return something the
+# frontend can discriminate on.
+thiserror = "2.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
