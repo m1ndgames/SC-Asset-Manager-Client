@@ -136,6 +136,13 @@ filesystem (`backend/mock.rs` stands in for the backend).
   reproduces the tunneling and is the regression test.
 - **Nothing is read until the user says so.** A first run reports the trade count it
   found and offers start-from-now (the default) or import; it never imports silently.
+- **`logTimestamp` in the id is what separates two identical sales.** Two sells of the
+  same commodity, same quantity, at the same kiosk minutes apart produce log lines that
+  are *byte-identical but for the timestamp* — verified live, and both are committed in
+  `session-12913470-261101.log`. Drop the timestamp from the UUIDv5 name string and the
+  two collapse to one id, so the queue's own dedupe silently swallows the second real
+  sale. The timestamp is not there to make the id unique-looking; it is there because
+  nothing else on the line distinguishes them.
 - **`quantityRaw` is never parsed.** The UUIDv5 name string takes every field verbatim
   from the log — `100800.000000` must stay exactly that string. There is a test
   asserting it never round-trips through `f64`; don't relax it.
@@ -185,8 +192,8 @@ sell lists one group per box size.
 This matters: reading only one `boxSize`/`unitAmount` pair — which is what a naive
 `field[value]` map gives you, since later keys overwrite earlier ones — makes parity
 appear to fail on ~11% of sells. PLAN.md §3.5 and an earlier draft of this file both got
-this wrong. Summed, it holds on **91 of 92** real trade lines (22/22 buys, 21/21
-`Location` sells, 49/50 `ResourceContainer` sells), so it is a sound signal worth
+this wrong. Summed, it holds on **92 of 93** real trade lines (22/22 buys, 21/21
+`Location` sells, 50/51 `ResourceContainer` sells), so it is a sound signal worth
 surfacing. `log/parse.rs` keeps `box_groups` as an ordered `Vec` for exactly this reason.
 
 A mismatch sets a warning flag on the review card — it does **not** reject the trade, and
@@ -195,7 +202,7 @@ A mismatch sets a warning flag on the review card — it does **not** reject the
 Two further drift detectors that do not depend on cargo box data at all:
 - the buy price cross-check (`shopPricePerCentiSCU × 100` vs `price / quantityScu`,
   within 0.1% on 22/22 real buys);
-- the unit token rule (`quantity[... cSCU]` on buys 21/21, bare on sells 71/71).
+- the unit token rule (`quantity[... cSCU]` on buys 21/21, bare on sells 72/72).
 
 ## What the log does *not* tell you about location
 
@@ -219,6 +226,41 @@ is in the loop, so don't re-litigate it without new data:
 - Unexplored lead: the kiosk entity carries `m_svLinkedLocationManagerId`. If one of
   those covers every kiosk at a station it would be a better within-session key than
   `shopId`. Needs a session with two kiosks at one station to test.
+
+## What the log does *not* tell you about money
+
+Auto-load/unload fees are invisible to the log, and `price`/`amount` are **gross**.
+
+Measured at a Baijini Point kiosk on 1 Nov 2026 with the confirmation panel and the
+resulting log line side by side:
+
+| | |
+|---|---|
+| quoted | `1,064.66`/SCU x 8 SCU = **8,517.28** gross |
+| `CARGO AUTO-LOAD` | **474** aUEC |
+| actually paid out | **8,043** aUEC |
+| what the log recorded | `amount[8517.000000]` — the **gross** |
+
+Neither the fee nor the net appears anywhere in the log. The only trace of it is the
+`autoLoading[1]` flag on the trade line.
+
+Corroborated on the buy side across the whole corpus: the `shopPricePerCentiSCU x 100`
+vs `price / quantity` cross-check drifts identically whether or not auto-load was used
+— `autoLoading[0]` n=8, mean +0.00031%; `autoLoading[1]` n=14, mean +0.00040%. That is
+ten-thousandths of a percent, i.e. nothing but `price` rounding to whole aUEC. A fee
+folded into `price` would show percent-scale drift on one group and not the other.
+
+**Consequence: every profit figure derivable from the log is gross commodity profit.**
+On the measured trade the fee was 5.6% of gross and **21% of the apparent profit**, and
+a normal run pays one on each leg. Therefore:
+
+- write `sellPrice` from the log as the commodity price — that is what the field means,
+  and the web app's Profit column is defined on it;
+- surface `autoLoading` on the review card with a plain note that realised proceeds are
+  lower;
+- **never** model, estimate or subtract a fee. It varies with distance and station, it
+  is not in the log, and a fabricated number in a shared database is worse than an
+  honestly gross one.
 
 ## Hard scope boundaries
 

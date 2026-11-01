@@ -89,10 +89,10 @@ fn corpus_totals_are_stable() {
         sells += r.sells;
     }
     assert_eq!(buys, 22, "buy lines across the corpus");
-    assert_eq!(sells, 71, "sell lines across the corpus");
+    assert_eq!(sells, 72, "sell lines across the corpus");
 }
 
-/// Summed cargo-box parity holds on 91 of 92 trade lines.
+/// Summed cargo-box parity holds on 92 of 93 trade lines.
 ///
 /// The single exception is one `boxSize[16] | unitAmount[7]` sell with
 /// `quantity[576]`. Pinning the count to exactly 1 means both a regression
@@ -153,7 +153,7 @@ fn buy_price_cross_check_holds_across_the_corpus() {
 }
 
 /// Unit tokens are structural: buys always carry ` cSCU`, sells never do.
-/// 22/22 and 71/71 across the corpus.
+/// 22/22 and 72/72 across the corpus.
 #[test]
 fn quantity_unit_token_is_consistent_per_kind() {
     for f in fixture_files() {

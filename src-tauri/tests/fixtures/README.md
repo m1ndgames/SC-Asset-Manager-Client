@@ -34,9 +34,9 @@ UUIDv5 vectors hash some of them verbatim.
 | | |
 |---|---|
 | buy lines | 22 |
-| sell lines | 71 |
+| sell lines | 72 |
 | failure lines | 16 |
-| location-info lines | 236 |
+| location-info lines | 239 |
 
 `session-12913470-current.log` is the session the two published id vectors in
 `INTEGRATIONS.md` §6 were taken from. It contains 4 buys, 3 sells and one
