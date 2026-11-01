@@ -10,13 +10,17 @@
 pub mod backend;
 pub mod commands;
 pub mod config;
+pub mod drain;
 pub mod error;
 pub mod ids;
 pub mod log;
 pub mod model;
 pub mod probe;
+pub mod queue;
+pub mod refdata;
 pub mod state;
 pub mod units;
+pub mod writer;
 pub mod watcher_task;
 pub mod watchstate;
 
@@ -36,6 +40,22 @@ pub fn run() {
         config::Config::default()
     });
 
+    // The queue is the single source of truth and must load before the window
+    // does, so a crash mid-review reappears rather than vanishing.
+    let queue = queue::Queue::open_default().unwrap_or_else(|e| {
+        tracing::error!(error = %e, "no config directory; the queue will not persist");
+        queue::Queue::open(std::env::temp_dir().join("sc-asset-manager-client"))
+    });
+    tracing::info!(
+        pending = queue.items().len(),
+        history = queue.history().len(),
+        "queue loaded"
+    );
+
+    // Cached reference data only. A refresh happens on request, and at startup
+    // when there is nothing cached — the app must open with the network down.
+    let refdata = refdata::load();
+
     tauri::Builder::default()
         // Two tailers would double-write every trade. A second launch must
         // focus the existing window instead of starting a second watcher.
@@ -48,7 +68,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(state::AppState::new(cfg))
+        .manage(state::AppState::new(cfg, queue, refdata))
         .invoke_handler(tauri::generate_handler![
             commands::detect_log_path,
             commands::rescan_log,
@@ -61,9 +81,57 @@ pub fn run() {
             commands::start_watcher,
             commands::stop_watcher,
             commands::watcher_status,
+            commands::get_queue,
+            commands::get_history,
+            commands::update_item,
+            commands::approve_item,
+            commands::reject_item,
+            commands::retry_item,
+            commands::drain_queue,
+            commands::get_refdata,
+            commands::refresh_refdata,
             probe::phase1_probe,
             probe::delete_test_asset,
         ])
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Approved items survive a restart; PLAN.md §6 wants them
+                // written before anything new is processed. Safe to repeat
+                // because every write is an idempotent upsert.
+                let report = drain::drain(&handle).await;
+                if report.written > 0 || report.failed > 0 {
+                    tracing::info!(?report, "drained approved items left from the last run");
+                }
+
+                // First run, or a cache that never populated.
+                let needs_refdata = {
+                    use tauri::Manager;
+                    handle.state::<state::AppState>().refdata().is_empty()
+                };
+                if needs_refdata {
+                    use tauri::Manager;
+                    let url = handle.state::<state::AppState>().config().app_url;
+                    match refdata::fetch(&url).await {
+                        Ok(d) => {
+                            let _ = refdata::save(&d);
+                            tracing::info!(
+                                commodities = d.commodities.len(),
+                                locations = d.locations.len(),
+                                "reference data fetched"
+                            );
+                            *handle.state::<state::AppState>().refdata.write().unwrap() = d;
+                            let _ = tauri::Emitter::emit(&handle, "refdata://updated", ());
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not fetch reference data; item names will be unresolved until a refresh"
+                        ),
+                    }
+                }
+            });
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

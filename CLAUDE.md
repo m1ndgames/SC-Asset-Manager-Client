@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Phases 0, 1 and 2 are done.** What exists and passes (149 tests green, clippy clean):
+**Phases 0-3 are done.** What exists and passes (199 tests green, clippy clean):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -21,9 +21,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   filter) and `watcher_task.rs` (the thread and the events). Surfaced in
   Diagnostics with a live feed.
 
-**Not built yet:** `queue.rs` and the queue state machine, `writer.rs`, `refdata.rs`,
-and the Review/History views, which are still placeholders. Next up is Phase 3: the
-review queue and the buy write path.
+- **The queue and the buy write path:** `queue.rs` (the state machine, persisted to
+  `queue.json` after every transition *and* every edit), `refdata.rs`
+  (commodities/locations, disk-cached, offline-tolerant), `writer.rs` (INTEGRATIONS.md
+  §8 once, backend-agnostic, tested against `backend/mock.rs`), `drain.rs` (the loop,
+  the locks, the events) and the Review Queue view with the Location combobox.
+
+**Not built yet:** the sell path (Phase 4), the buy merge rule (Phase 5), PocketBase
+(Phase 6), and the History view, which is still a placeholder.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an
@@ -191,6 +196,29 @@ Two further drift detectors that do not depend on cargo box data at all:
 - the buy price cross-check (`shopPricePerCentiSCU × 100` vs `price / quantityScu`,
   within 0.1% on 21/21 real buys);
 - the unit token rule (`quantity[... cSCU]` on buys 21/21, bare on sells 70/70).
+
+## What the log does *not* tell you about location
+
+Measured against a full session log, not assumed. This is the evidence for why a human
+is in the loop, so don't re-litigate it without new data:
+
+- **Nothing in the log names the station.** A trade made at Port Tressler produced zero
+  occurrences of "Tressler" anywhere in a 680 KB log.
+- **`LocationId` is not a place.** In `ClSetSelectedPlayerLocationInfo`, every non-null
+  value matched the player's own `vehicleEntityId`. It identifies the *selected cargo
+  container*. Never render it as a location — it is labelled "container" in the UI for
+  this reason. (The committed fixtures cannot show this: they are slices of
+  commodity-class lines with no vehicle lines in them.)
+- **`shopId` and `kioskId` are per-session entity ids.** 24 distinct `shopId`s across 11
+  sessions; exactly one appears in two. So "remember the location for this kiosk" is
+  valid *within* a session only, which is why `suggestions.svelte.ts` is module state
+  and never touches disk.
+- **`shopName` is usually a generic template** (`SCShop_Admin_lt_base_g`). Some do
+  self-identify — `SCShop_AdminOffice_GrimHex`, `SCShop_ht_delta_shubin_m_store`,
+  `TDD_SCShop-001` — but admin offices everywhere share the one name.
+- Unexplored lead: the kiosk entity carries `m_svLinkedLocationManagerId`. If one of
+  those covers every kiosk at a station it would be a better within-session key than
+  `shopId`. Needs a session with two kiosks at one station to test.
 
 ## Hard scope boundaries
 

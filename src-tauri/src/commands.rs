@@ -9,7 +9,10 @@ use crate::backend::firebase::FirebaseBackend;
 use crate::backend::{BackendError, HealthReport, SyncBackend};
 use crate::config::{self, BackendKind, ConfigDto, ConfigPatch, FirebaseConfig};
 use crate::error::{AppError, AppResult};
+use crate::drain;
 use crate::log::watcher::{self, ColdStart, WatchStatus};
+use crate::queue::{self, ItemPatch, ItemView};
+use crate::refdata::{self, RefData};
 use crate::log::{discover, scan};
 use crate::state::AppState;
 use crate::{watcher_task, watchstate};
@@ -232,6 +235,121 @@ pub fn stop_watcher(state: State<'_, AppState>) -> AppResult<()> {
 #[tauri::command]
 pub fn watcher_status(state: State<'_, AppState>) -> Option<WatchStatus> {
     state.watcher.lock().unwrap().as_ref().map(|h| h.status())
+}
+
+// ---------------------------------------------------------------------------
+// The review queue
+// ---------------------------------------------------------------------------
+
+/// The whole queue as the UI renders it: a projection, never a handle.
+///
+/// The frontend calls a command and re-renders from what comes back. It never
+/// edits an item locally, which is why there is no reconciliation logic and no
+/// "unsaved edits" state anywhere in this app.
+#[tauri::command]
+pub fn get_queue(state: State<'_, AppState>) -> Vec<ItemView> {
+    let rd = state.refdata();
+    let q = state.queue.lock().unwrap();
+    q.items().iter().map(|i| queue::view(i, &rd)).collect()
+}
+
+#[tauri::command]
+pub fn get_history(state: State<'_, AppState>, limit: Option<usize>) -> Vec<ItemView> {
+    let rd = state.refdata();
+    let q = state.queue.lock().unwrap();
+    // Newest first: history is read to check what just happened.
+    let mut items: Vec<&crate::queue::QueueItem> = q.history().iter().collect();
+    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    items
+        .into_iter()
+        .take(limit.unwrap_or(200))
+        .map(|i| queue::view(i, &rd))
+        .collect()
+}
+
+/// Apply a field edit. Persisted before this returns.
+#[tauri::command]
+pub fn update_item(
+    state: State<'_, AppState>,
+    id: String,
+    patch: ItemPatch,
+) -> AppResult<ItemView> {
+    let rd = state.refdata();
+    let mut q = state.queue.lock().unwrap();
+    let item = q.update(&id, patch)?;
+    Ok(queue::view(item, &rd))
+}
+
+/// Approve an item and write it.
+///
+/// Approval and writing are one user action, so they are one command: an
+/// "Approved" card that then sat there doing nothing until some other event
+/// fired would be indistinguishable from a bug.
+#[tauri::command]
+pub async fn approve_item(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<drain::DrainReport> {
+    {
+        // Scoped: the guard must not be alive across the await below.
+        let rd = state.refdata();
+        let mut q = state.queue.lock().unwrap();
+        q.approve(&id, &rd)?;
+    }
+    Ok(drain::drain(&app).await)
+}
+
+#[tauri::command]
+pub fn reject_item(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    let mut q = state.queue.lock().unwrap();
+    q.reject(&id)
+}
+
+/// Retry a failed write.
+#[tauri::command]
+pub async fn retry_item(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<drain::DrainReport> {
+    {
+        let mut q = state.queue.lock().unwrap();
+        q.retry(&id)?;
+    }
+    Ok(drain::drain(&app).await)
+}
+
+/// Write anything already approved. Called on startup, and available manually
+/// after a backend problem is fixed.
+#[tauri::command]
+pub async fn drain_queue(app: tauri::AppHandle) -> drain::DrainReport {
+    drain::drain(&app).await
+}
+
+// ---------------------------------------------------------------------------
+// Reference data
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_refdata(state: State<'_, AppState>) -> RefData {
+    state.refdata()
+}
+
+/// Fetch reference data and cache it.
+///
+/// On failure the cached copy is kept: losing every item name because the
+/// network blinked would be worse than showing slightly stale ones.
+#[tauri::command]
+pub async fn refresh_refdata(state: State<'_, AppState>) -> AppResult<RefData> {
+    let url = state.config().app_url;
+    let fetched = refdata::fetch(&url).await?;
+    if let Err(e) = refdata::save(&fetched) {
+        // Worth saying, not worth failing: it is in memory and working.
+        tracing::warn!(error = %e, "fetched reference data but could not cache it");
+    }
+    *state.refdata.write().unwrap() = fetched.clone();
+    Ok(fetched)
 }
 
 #[cfg(test)]

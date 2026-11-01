@@ -9,6 +9,7 @@
 //! write pipeline, so `writer.rs` implements INTEGRATIONS.md §8 once.
 
 pub mod firebase;
+pub mod mock;
 pub mod value;
 
 use async_trait::async_trait;

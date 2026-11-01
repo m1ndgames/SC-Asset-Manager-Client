@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
@@ -97,8 +97,24 @@ pub fn start(app: AppHandle, cfg: &Config, path: PathBuf, offset: u64) -> AppRes
                             tracing::info!("Game.log was rotated or truncated");
                             let _ = app.emit(EV_ROTATED, watcher.status());
                         }
+                        let mut queue_changed = false;
                         for t in &tick.promoted {
                             tracing::info!(id = %t.line.id, kind = ?t.line.kind, "trade detected");
+                            // Into the queue before the event: the UI refetches
+                            // on the event, so emitting first would race with
+                            // the item actually existing.
+                            {
+                                let state = app.state::<crate::state::AppState>();
+                                let mut q = state.queue.lock().unwrap();
+                                match q.enqueue(t.clone()) {
+                                    Ok(_) => queue_changed = true,
+                                    Err(e) => {
+                                        // Already in history: seen and dealt
+                                        // with. Not a failure.
+                                        tracing::debug!(error = %e, id = %t.line.id, "not enqueued");
+                                    }
+                                }
+                            }
                             let _ = app.emit(EV_DETECTED, t);
                         }
                         for d in &tick.discarded {
@@ -108,7 +124,22 @@ pub fn start(app: AppHandle, cfg: &Config, path: PathBuf, offset: u64) -> AppRes
                                 delta_ms = d.delta_ms,
                                 "detection retracted by a failure line"
                             );
+                            {
+                                let state = app.state::<crate::state::AppState>();
+                                let mut q = state.queue.lock().unwrap();
+                                let detected = crate::log::scan::DetectedTrade {
+                                    line: d.trade.clone(),
+                                    location_id_hint: None,
+                                };
+                                let reason = format!("{} after {}ms", d.error.result, d.delta_ms);
+                                if let Err(e) = q.record_discarded(detected, reason) {
+                                    tracing::warn!(error = %e, "could not record a discard");
+                                }
+                            }
                             let _ = app.emit(EV_DISCARDED, d);
+                        }
+                        if queue_changed {
+                            let _ = app.emit(crate::drain::EV_QUEUE, ());
                         }
                         for m in &tick.malformed {
                             // Loudly: this is how a game patch breaking the

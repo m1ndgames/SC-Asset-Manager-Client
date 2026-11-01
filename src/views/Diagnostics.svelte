@@ -277,7 +277,9 @@
                 {f.t.resourceGuid.slice(0, 8)}…
               </span>
               {#if f.t.locationIdHint}
-                <span class="text-xs text-muted">loc {f.t.locationIdHint}</span>
+                <span class="text-xs text-muted" title="Selected cargo container, not a location">
+                  container {f.t.locationIdHint}
+                </span>
               {/if}
             {:else if f.k === "discarded"}
               <span class="text-danger-text">
@@ -409,7 +411,16 @@
                     </span>
                   {/if}
                   {#if t.locationIdHint}
-                    <span class="text-muted">loc {t.locationIdHint}</span>
+                    <!-- Not a place: verified on a full session log, every
+                         non-null LocationId equalled the player's own
+                         vehicleEntityId. It identifies the selected cargo
+                         container, so it must not be presented as a location. -->
+                    <span
+                      class="text-muted"
+                      title="The selected cargo container's entity id — often your own ship. Not a location."
+                    >
+                      container {t.locationIdHint}
+                    </span>
                   {/if}
                 </td>
               </tr>

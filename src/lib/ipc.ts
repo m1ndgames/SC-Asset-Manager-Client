@@ -227,3 +227,123 @@ export const stopWatcher = (): Promise<void> => invoke("stop_watcher");
 
 export const watcherStatus = (): Promise<WatchStatus | null> =>
   invoke("watcher_status");
+
+// ---------------------------------------------------------------------------
+// The review queue
+// ---------------------------------------------------------------------------
+
+export type ItemState =
+  | "pendingReview"
+  | "approved"
+  | "writing"
+  | "written"
+  | "rejected"
+  | "discarded"
+  | "failed";
+
+export type Blocker =
+  | { kind: "locationMissing" }
+  | { kind: "itemUnresolved"; guid: string }
+  | { kind: "amountInvalid" }
+  | { kind: "priceInvalid" };
+
+export type CargoUnit = "SCU" | "cSCU" | "μSCU";
+
+export interface ItemEdits {
+  itemName: string | null;
+  location: string | null;
+  amountScu: number | null;
+  unitPricePerScu: number | null;
+  displayUnit: CargoUnit | null;
+}
+
+/** One queue item plus everything derived, as the card renders it. */
+export interface ItemView {
+  id: string;
+  state: ItemState;
+  detected: DetectedTrade;
+  edits: ItemEdits;
+  createdAt: string;
+  updatedAt: string;
+  error: string | null;
+  attempts: number;
+  mergeTargetId: string | null;
+  mergeApplied: boolean;
+
+  /** From commodities.json; null means the user must name it. */
+  resolvedItemName: string | null;
+  /** What will be written, always per-SCU. */
+  effectiveAmountScu: number;
+  effectiveUnitPricePerScu: number;
+  /** The same figures in the chosen display unit, rescaled together. */
+  displayAmount: number;
+  displayUnitPrice: number;
+  displayUnit: CargoUnit;
+  totalAuec: number;
+  blockers: Blocker[];
+  canApprove: boolean;
+}
+
+/**
+ * Omit a field to leave it alone; pass `null` to clear it.
+ *
+ * The difference is load-bearing — "the user cleared the location" and "the
+ * user did not touch the location" must not be the same request.
+ */
+export interface ItemPatch {
+  itemName?: string | null;
+  location?: string | null;
+  amountScu?: number | null;
+  unitPricePerScu?: number | null;
+  displayUnit?: CargoUnit;
+}
+
+export interface Commodity {
+  name: string;
+  key: string;
+}
+
+export interface RefData {
+  commodities: Record<string, Commodity>;
+  locations: string[];
+  fetchedAt: string | null;
+  sourceUrl: string | null;
+}
+
+export interface DrainReport {
+  written: number;
+  failed: number;
+  writtenIds: string[];
+  stopped: string | null;
+}
+
+/** Events the write path emits. */
+export const QEV = {
+  written: "tx://written",
+  writeFailed: "tx://write-failed",
+  queueChanged: "queue://changed",
+  refdataUpdated: "refdata://updated",
+} as const;
+
+export const getQueue = (): Promise<ItemView[]> => invoke("get_queue");
+
+export const getHistory = (limit?: number): Promise<ItemView[]> =>
+  invoke("get_history", { limit });
+
+export const updateItem = (id: string, patch: ItemPatch): Promise<ItemView> =>
+  invoke("update_item", { id, patch });
+
+export const approveItem = (id: string): Promise<DrainReport> =>
+  invoke("approve_item", { id });
+
+export const rejectItem = (id: string): Promise<void> =>
+  invoke("reject_item", { id });
+
+export const retryItem = (id: string): Promise<DrainReport> =>
+  invoke("retry_item", { id });
+
+export const drainQueue = (): Promise<DrainReport> => invoke("drain_queue");
+
+export const getRefdata = (): Promise<RefData> => invoke("get_refdata");
+
+export const refreshRefdata = (): Promise<RefData> => invoke("refresh_refdata");
