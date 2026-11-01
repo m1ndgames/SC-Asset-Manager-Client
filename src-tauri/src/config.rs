@@ -128,6 +128,7 @@ impl Config {
             backend_kind: self.backend.kind,
             email: self.backend.email.clone(),
             password_set: !self.backend.password.is_empty(),
+            backend_ready: self.backend_ready(),
             firebase: self.backend.firebase.clone(),
             pocketbase: self.backend.pocketbase.clone(),
         }
@@ -159,6 +160,10 @@ pub struct ConfigDto {
     pub email: String,
     /// True when a password is stored. The password itself never crosses here.
     pub password_set: bool,
+    /// Whether the backend has everything it needs to attempt a sign-in.
+    /// Computed by `Config::backend_ready` so the rule lives in one place
+    /// rather than being re-derived in TypeScript and drifting.
+    pub backend_ready: bool,
     pub firebase: FirebaseConfig,
     pub pocketbase: PocketbaseConfig,
 }

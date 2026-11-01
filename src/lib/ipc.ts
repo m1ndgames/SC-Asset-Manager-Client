@@ -120,6 +120,8 @@ export interface ConfigDto {
   backendKind: BackendKind;
   email: string;
   passwordSet: boolean;
+  /** Computed in Rust by `Config::backend_ready`, so the rule lives in one place. */
+  backendReady: boolean;
   firebase: FirebaseConfig;
   pocketbase: PocketbaseConfig;
 }

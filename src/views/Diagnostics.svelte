@@ -8,7 +8,6 @@
     planWatchStart,
     startWatcher,
     stopWatcher,
-    watcherStatus,
     EV,
     type ScanReport,
     type LogLocation,
@@ -17,6 +16,7 @@
     type DetectedTrade,
     type DiscardedTrade,
   } from "../lib/ipc";
+  import { app, refreshWatcher } from "../lib/status.svelte";
 
   let location = $state<LogLocation | null>(null);
   let report = $state<ScanReport | null>(null);
@@ -24,7 +24,9 @@
   let error = $state<string | null>(null);
 
   // --- the watcher -------------------------------------------------------
-  let status = $state<WatchStatus | null>(null);
+  // Status comes from the shared store (subscribed once in App.svelte), so
+  // this panel and the footer can never disagree.
+  const status = $derived(app.watcher);
   let plan = $state<ColdStart | null>(null);
   let starting = $state(false);
   /** Newest first. Nothing is written anywhere yet — Phase 3 adds the queue. */
@@ -56,7 +58,7 @@
     starting = true;
     error = null;
     try {
-      status = await startWatcher(offset);
+      app.watcher = await startWatcher(offset);
     } catch (e) {
       error = isAppError(e) ? e.message : String(e);
     } finally {
@@ -67,7 +69,7 @@
   async function stop() {
     try {
       await stopWatcher();
-      status = null;
+      await refreshWatcher();
       await refreshPlan();
     } catch (e) {
       error = isAppError(e) ? e.message : String(e);
@@ -76,7 +78,6 @@
 
   $effect(() => {
     const subs = [
-      listen<WatchStatus>(EV.status, (e) => (status = e.payload)),
       listen<WatchStatus>(EV.rotated, () =>
         push({ k: "rotated", at: clock() }),
       ),
@@ -125,8 +126,8 @@
 
   (async () => {
     await detect();
-    status = await watcherStatus();
-    if (!status) await refreshPlan();
+    await refreshWatcher();
+    if (!app.watcher?.running) await refreshPlan();
   })();
 </script>
 
