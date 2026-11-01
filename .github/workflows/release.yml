@@ -1,8 +1,8 @@
 # Builds and publishes a Windows release on a `v*` tag.
 #
-# Two secrets are required, and without them the build silently produces no
-# updater artifacts at all — the installers come out fine, `latest.json` does
-# not, and every installed copy quietly stops seeing updates:
+# Two secrets are required, and the build **fails** without them — see the note
+# at the bottom of the README. Set both before pushing the first tag, or the
+# release job gets as far as producing installers and then exits 1:
 #
 #   TAURI_SIGNING_PRIVATE_KEY           the contents of sc-asset-manager-client.key
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the password that key was generated with
@@ -81,7 +81,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
+          # Only a tag creates a release. On a manual dispatch this is empty,
+          # which makes tauri-action build and sign without publishing
+          # anything -- otherwise a dry run would leave a stray draft release
+          # named after the branch.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           releaseName: SC Asset Manager Client ${{ github.ref_name }}
           releaseBody: |
             Windows installers are below. **They are not code-signed**, so
