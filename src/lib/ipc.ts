@@ -274,6 +274,12 @@ export interface ItemView {
 
   /** From commodities.json; null means the user must name it. */
   resolvedItemName: string | null;
+  /**
+   * The name that will actually be written — a user override wins over the
+   * resolved name. Display this; `resolvedItemName` is only for the name
+   * input's placeholder.
+   */
+  effectiveItemName: string | null;
   /** What will be written, always per-SCU. */
   effectiveAmountScu: number;
   effectiveUnitPricePerScu: number;

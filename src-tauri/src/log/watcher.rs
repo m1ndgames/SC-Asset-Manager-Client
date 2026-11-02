@@ -51,9 +51,12 @@ pub enum ColdStart {
     /// Same file, and our offset is still inside it. The common case, and the
     /// only one that reprocesses nothing.
     Resume { offset: u64 },
-    /// A session happened while the client was closed. The caller parses the
-    /// whole file with `hold_ms = 0` — every error that will ever exist is
-    /// already in it — and filters with [`backfill`].
+    /// A session happened while the client was closed. The caller re-reads the
+    /// file from the start; duplicates collapse on the deterministic id,
+    /// because `Queue::enqueue` refuses an id already in history.
+    ///
+    /// The saved offset is **not** usable here — it is a byte position in a
+    /// different file. See `commands::offset_for`.
     Backfill {
         /// Why, so Diagnostics can say so rather than just acting.
         reason: BackfillReason,
@@ -320,7 +323,13 @@ impl Watcher {
         } else if !had_pending {
             // Something is now being held. The floor is where this batch
             // started — before any line that produced a pending detection.
-            self.safe_offset = offset_before_batch;
+            //
+            // Unless the same batch also rotated: `offset_before_batch` is
+            // then a position in the *previous* file, and persisting it beside
+            // the new file's identity makes the next launch `Resume` past
+            // everything before it. The new file's start is the only floor
+            // that means anything.
+            self.safe_offset = if out.rotated { 0 } else { offset_before_batch };
         }
         // While pending stays non-empty across ticks the floor simply holds.
         out.offset_advanced = self.safe_offset != before;

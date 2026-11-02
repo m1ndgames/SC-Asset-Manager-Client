@@ -236,6 +236,44 @@ fn rotation_resets_the_position_but_keeps_the_duplicate_filter() {
     assert_eq!(w.state().offset, log.len());
 }
 
+/// A tick that rotates *and* holds a detection must floor the safe offset at
+/// the start of the new file, not at where the batch began.
+///
+/// `offset_before_batch` is a position in the previous file. Persisting it
+/// beside the new file's identity makes `plan_cold_start` see a matching header
+/// and an offset within bounds, so the next launch `Resume`s past everything
+/// before it. Reachable whenever the poll thread stalls (a sleep/resume) across
+/// a game relaunch and the first tick back carries both the rotation and a
+/// trade line.
+#[test]
+fn a_rotation_that_also_holds_a_detection_floors_the_offset_at_zero() {
+    let log = Log::new();
+    let mut w = log.watcher(0);
+    let t0 = Instant::now();
+
+    // Build up a real offset in the pre-rotation file.
+    for _ in 0..20 {
+        log.append(CHATTER);
+    }
+    w.tick(t0).unwrap();
+    let before_rotation = w.state().offset;
+    assert!(before_rotation > 0, "need a non-zero offset to regress on");
+
+    // The game relaunched and traded before we next looked: one tick, both
+    // the rotation and a line that goes into the grace window.
+    log.truncate();
+    log.append(BUY);
+    let tick = w.tick(t0 + Duration::from_secs(10)).unwrap();
+
+    assert!(tick.rotated, "the rotation must be seen");
+    assert_eq!(tick.promoted.len(), 0, "and the buy is still held");
+    assert_eq!(
+        w.state().offset,
+        0,
+        "the floor must be the new file's start, not {before_rotation} from the old one"
+    );
+}
+
 #[test]
 fn shutdown_promotes_what_is_still_held_rather_than_dropping_it() {
     let log = Log::new();

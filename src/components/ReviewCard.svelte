@@ -77,7 +77,7 @@
   // change which asset is hit and whether it is over-sold.
   $effect(() => {
     if (item.detected.kind !== "sell") return;
-    const key = `${item.id}|${item.effectiveAmountScu}|${item.resolvedItemName}|${item.edits.itemName}`;
+    const key = `${item.id}|${item.effectiveAmountScu}|${item.effectiveItemName}`;
     let cancelled = false;
     previewing = true;
     previewSell(item.id)
@@ -201,7 +201,7 @@
     </span>
 
     <h3 class="font-display text-base text-text">
-      {item.resolvedItemName ?? item.edits.itemName ?? "Unidentified item"}
+      {item.effectiveItemName ?? "Unidentified item"}
     </h3>
 
     <span class="font-mono text-xs text-muted">
@@ -537,7 +537,7 @@
 
           {#if preview.otherCandidates.length}
             <p class="mt-2 text-xs text-muted">
-              {preview.otherCandidates.length} other {item.resolvedItemName ??
+              {preview.otherCandidates.length} other {item.effectiveItemName ??
                 "item"} asset{preview.otherCandidates.length === 1 ? "" : "s"} exist.
               The oldest is sold first and the rest are untouched.
             </p>

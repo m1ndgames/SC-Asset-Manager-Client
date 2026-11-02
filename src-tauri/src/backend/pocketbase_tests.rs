@@ -145,7 +145,7 @@ const TRADE_COLUMNS: &[&str] = &[
 /// without an error, so every emitted key must be a known column.
 #[test]
 fn no_asset_field_is_sent_that_pocketbase_has_no_column_for() {
-    let fields = to_pb_fields(&asset(), UUID).unwrap();
+    let fields = to_pb_fields(&asset(), UUID, &[]).unwrap();
     for k in fields.keys() {
         assert!(
             ASSET_COLUMNS.contains(&k.as_str()),
@@ -156,7 +156,7 @@ fn no_asset_field_is_sent_that_pocketbase_has_no_column_for() {
 
 #[test]
 fn no_trade_field_is_sent_that_pocketbase_has_no_column_for() {
-    let fields = to_pb_fields(&trade(), UUID).unwrap();
+    let fields = to_pb_fields(&trade(), UUID, &trade_clearable()).unwrap();
     for k in fields.keys() {
         assert!(
             TRADE_COLUMNS.contains(&k.as_str()),
@@ -169,7 +169,7 @@ fn no_trade_field_is_sent_that_pocketbase_has_no_column_for() {
 /// that invents a column; this one catches a rename that loses a real one.
 #[test]
 fn every_required_asset_column_is_present() {
-    let fields = to_pb_fields(&asset(), UUID).unwrap();
+    let fields = to_pb_fields(&asset(), UUID, &[]).unwrap();
     for required in ["app_id", "item", "amount", "buyPrice", "location", "createdAt"] {
         assert!(fields.contains_key(required), "missing `{required}`");
     }
@@ -177,7 +177,7 @@ fn every_required_asset_column_is_present() {
 
 #[test]
 fn every_required_trade_column_is_present() {
-    let fields = to_pb_fields(&trade(), UUID).unwrap();
+    let fields = to_pb_fields(&trade(), UUID, &trade_clearable()).unwrap();
     for required in [
         "app_id",
         "item",
@@ -195,7 +195,7 @@ fn every_required_trade_column_is_present() {
 /// app, which reads `app_id` in preference to the mangled key.
 #[test]
 fn app_id_is_snake_case_and_holds_the_real_uuid() {
-    let fields = to_pb_fields(&asset(), UUID).unwrap();
+    let fields = to_pb_fields(&asset(), UUID, &[]).unwrap();
     assert_eq!(fields["app_id"], json!(UUID));
     assert!(!fields.contains_key("appId"));
 }
@@ -204,7 +204,7 @@ fn app_id_is_snake_case_and_holds_the_real_uuid() {
 /// the only way back to the uuid the rest of the system uses.
 #[test]
 fn the_primary_key_is_the_mangled_id_and_both_are_written() {
-    let fields = to_pb_fields(&asset(), UUID).unwrap();
+    let fields = to_pb_fields(&asset(), UUID, &[]).unwrap();
     assert_eq!(fields["id"], json!(PB_ID));
     assert_eq!(fields["app_id"], json!(UUID));
     assert_ne!(fields["id"], fields["app_id"], "both, not one twice");
@@ -216,7 +216,7 @@ fn the_primary_key_is_the_mangled_id_and_both_are_written() {
 fn a_leading_digit_is_prefixed() {
     // The published buy vector, which begins with `4`.
     let digit_first = "4ed7a396-7398-590d-be1c-d3a012c0dcb6";
-    let fields = to_pb_fields(&trade(), digit_first).unwrap();
+    let fields = to_pb_fields(&trade(), digit_first, &trade_clearable()).unwrap();
     assert_eq!(fields["id"], json!("r4ed7a3967398590dbe1cd3a012c0dcb6"));
     assert_eq!(fields["app_id"], json!(digit_first));
 }
@@ -226,17 +226,17 @@ fn a_leading_digit_is_prefixed() {
 /// `quality` to 0 or clearing a value the web app owns.
 #[test]
 fn fields_this_client_does_not_own_are_absent_rather_than_zero() {
-    let a = to_pb_fields(&asset(), UUID).unwrap();
+    let a = to_pb_fields(&asset(), UUID, &[]).unwrap();
     assert!(!a.contains_key("quality"), "absent, never 0");
     assert!(!a.contains_key("uexBuyId"));
-    let t = to_pb_fields(&trade(), UUID).unwrap();
+    let t = to_pb_fields(&trade(), UUID, &trade_clearable()).unwrap();
     assert!(!t.contains_key("uexSellId"));
 }
 
 /// An unrounded price must stay unrounded; it is a JSON number, not a string.
 #[test]
 fn prices_are_numbers_and_are_not_rounded() {
-    let fields = to_pb_fields(&asset(), UUID).unwrap();
+    let fields = to_pb_fields(&asset(), UUID, &[]).unwrap();
     assert_eq!(fields["buyPrice"].as_f64().unwrap(), 188.9409);
     assert!(fields["amount"].is_number());
 }
@@ -244,7 +244,7 @@ fn prices_are_numbers_and_are_not_rounded() {
 /// The unit keeps its contract spelling.
 #[test]
 fn the_unit_keeps_its_contract_spelling() {
-    let fields = to_pb_fields(&asset(), UUID).unwrap();
+    let fields = to_pb_fields(&asset(), UUID, &[]).unwrap();
     assert_eq!(fields["unit"], json!("SCU"));
 }
 
@@ -254,7 +254,7 @@ fn the_unit_keeps_its_contract_spelling() {
 fn a_non_uuid_id_is_refused_rather_than_mangled() {
     let mut a = asset();
     a.id = "not-a-uuid".into();
-    let err = to_pb_fields(&a, &a.id).unwrap_err();
+    let err = to_pb_fields(&a, &a.id, &[]).unwrap_err();
     assert!(err.to_string().contains("not a uuid"), "{err}");
 }
 
@@ -296,7 +296,7 @@ fn a_read_record_carries_the_uuid_not_the_pocketbase_key() {
 #[test]
 fn an_asset_round_trips() {
     let before = asset();
-    let mut row = to_pb_fields(&before, &before.id).unwrap();
+    let mut row = to_pb_fields(&before, &before.id, &[]).unwrap();
     // What the server adds on the way back.
     row.insert("collectionName".into(), json!("assets"));
     let after = asset_from_pb(&Value::Object(row)).expect("parsed");
@@ -415,4 +415,72 @@ fn an_unset_column_is_not_a_missing_column() {
 #[test]
 fn an_empty_collection_yields_no_schema_warning() {
     assert!(missing_columns(&[], LATE_ASSET_COLUMNS).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Clearing what a PATCH cannot delete
+// ---------------------------------------------------------------------------
+
+/// An orphan sell has no buy side. Firestore deletes those fields via
+/// `updateMask`; PocketBase has no mask and a PATCH cannot delete a column, so
+/// they must be sent explicitly or a trade re-written as an orphan keeps a
+/// `buyPrice` from an asset that no longer applies -- and the web app's Profit
+/// column shows a number instead of nothing.
+#[test]
+fn an_orphan_trade_clears_the_buy_side_rather_than_leaving_it_stale() {
+    let mut orphan = trade();
+    orphan.buy_price = None;
+    orphan.buy_unit = None;
+    orphan.buy_location = None;
+
+    let fields = to_pb_fields(&orphan, UUID, &trade_clearable()).unwrap();
+    assert_eq!(fields["buyPrice"], json!(0), "must be sent, not omitted");
+    assert_eq!(fields["buyUnit"], json!(""));
+    assert_eq!(fields["buyLocation"], json!(""));
+}
+
+/// A matched sell must still send its real buy-side values, not the blanks.
+#[test]
+fn a_matched_trade_keeps_its_real_buy_side() {
+    let fields = to_pb_fields(&trade(), UUID, &trade_clearable()).unwrap();
+    assert_eq!(fields["buyPrice"].as_f64().unwrap(), 188.9409);
+    assert_eq!(fields["buyUnit"], json!("SCU"));
+    assert_eq!(fields["buyLocation"], json!("Port Tressler"));
+}
+
+/// The clearing list must never touch the fields the web app owns: omitting
+/// them from a PATCH is exactly what leaves them alone.
+#[test]
+fn clearing_never_reaches_web_app_owned_fields() {
+    for (k, _) in trade_clearable() {
+        assert!(
+            !["quality", "uexBuyId", "uexSellId"].contains(&k),
+            "`{k}` is owned by the web app and must not be written"
+        );
+    }
+    let fields = to_pb_fields(&trade(), UUID, &trade_clearable()).unwrap();
+    assert!(!fields.contains_key("uexSellId"));
+}
+
+/// PocketBase returns `""` for an unset Text column, so an absent check alone
+/// lets an empty `app_id` through -- producing an asset with `id: ""` that can
+/// be picked as a sell or merge target and then fails every id-based call on
+/// the uuid parse.
+#[test]
+fn an_empty_app_id_is_rejected_like_a_missing_one() {
+    for bad in ["", "   "] {
+        let row = json!({
+            "id": PB_ID,
+            "app_id": bad,
+            "item": "Ammonia",
+            "amount": 1.0,
+            "buyPrice": 1.0,
+            "location": "x",
+            "createdAt": "x",
+        });
+        assert!(
+            asset_from_pb(&row).is_none(),
+            "an app_id of {bad:?} must not produce a record"
+        );
+    }
 }

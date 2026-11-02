@@ -254,7 +254,35 @@ async fn pb_error(what: &str, res: reqwest::Response) -> BackendError {
 
 /// Turn a record into the PocketBase body: the app's `id` becomes `app_id`, and
 /// `id` becomes the mangled primary key. §6 requires both.
-fn to_pb_fields<T: serde::Serialize>(record: &T, app_id: &str) -> BackendResult<Map<String, Value>> {
+/// Buy-side columns on a trade that this client owns and may need to *clear*.
+///
+/// Firestore handles this with `updateMask`: the paths are listed, so a field
+/// absent from the body is deleted and an orphan trade ends up with no
+/// buy-side values. PocketBase has no mask and a `PATCH` cannot delete a
+/// column, so `skip_serializing_if` would simply leave the previous values in
+/// place -- a trade re-written as an orphan would keep a `buyPrice` from an
+/// asset that no longer applies, and the web app's Profit column would show a
+/// number computed against it instead of nothing.
+///
+/// Sent as the column's empty value rather than `null`, which is what a record
+/// written without them gets anyway, so a re-write matches a fresh write.
+/// Unverified against a live instance.
+///
+/// `quality`, `uexBuyId` and `uexSellId` are deliberately absent: the web app
+/// owns them, and omitting them from a `PATCH` is what leaves them untouched.
+fn trade_clearable() -> Vec<(&'static str, Value)> {
+    vec![
+        ("buyPrice", json!(0)),
+        ("buyUnit", json!("")),
+        ("buyLocation", json!("")),
+    ]
+}
+
+fn to_pb_fields<T: serde::Serialize>(
+    record: &T,
+    app_id: &str,
+    clearable: &[(&str, Value)],
+) -> BackendResult<Map<String, Value>> {
     let Value::Object(mut map) = serde_json::to_value(record)
         .map_err(|e| BackendError::Other(e.to_string()))?
     else {
@@ -267,6 +295,9 @@ fn to_pb_fields<T: serde::Serialize>(record: &T, app_id: &str) -> BackendResult<
     map.remove("id");
     map.insert("app_id".into(), json!(app_id));
     map.insert("id".into(), json!(to_pb_id(&uuid)));
+    for (k, empty) in clearable {
+        map.entry((*k).to_string()).or_insert_with(|| empty.clone());
+    }
     Ok(map)
 }
 
@@ -275,7 +306,17 @@ fn to_pb_fields<T: serde::Serialize>(record: &T, app_id: &str) -> BackendResult<
 fn asset_from_pb(v: &Value) -> Option<AssetRecord> {
     let obj = v.as_object()?;
     let mut m = obj.clone();
-    let app_id = m.get("app_id").and_then(Value::as_str)?.to_string();
+    // An unset Text column comes back as `""`, so absent is not the only way
+    // `app_id` can be missing. An empty one would produce an AssetRecord with
+    // `id: ""`, which can be picked as a sell or merge target and then fails
+    // every id-based call on the uuid parse -- leaving a sell's asset
+    // undecremented, or aborting a merge after the journal was written.
+    let app_id = m
+        .get("app_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
     m.insert("id".into(), json!(app_id));
     m.remove("app_id");
     // PocketBase returns "" for an unset optional Text column, and 0 for an
@@ -417,7 +458,7 @@ impl SyncBackend for PocketbaseBackend {
         if asset.id.trim().is_empty() {
             return Err(BackendError::Other("asset has no id".into()));
         }
-        let fields = to_pb_fields(asset, &asset.id)?;
+        let fields = to_pb_fields(asset, &asset.id, &[])?;
         self.upsert(ASSETS, fields).await
     }
 
@@ -425,7 +466,7 @@ impl SyncBackend for PocketbaseBackend {
         if trade.id.trim().is_empty() {
             return Err(BackendError::Other("trade has no id".into()));
         }
-        let fields = to_pb_fields(trade, &trade.id)?;
+        let fields = to_pb_fields(trade, &trade.id, &trade_clearable())?;
         self.upsert(TRADES, fields).await
     }
 

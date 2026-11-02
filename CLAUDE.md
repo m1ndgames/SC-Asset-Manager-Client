@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Current state
 
 **Phases 0-6 and 8 are done**, plus the History view and autostart. What exists
-and passes (268 tests green, clippy clean under `-D warnings`):
+and passes (277 tests green, clippy clean under `-D warnings`):
 
 - Scaffold: Tauri 2 + Svelte 5 (runes) + Tailwind v4, `@theme` copied verbatim, fonts
   self-hosted, four-tab shell, updater keypair generated (password-protected) and
@@ -564,30 +564,34 @@ What *is* tested is the naming, and that is deliberate:
   existing record to infer from and reports nothing on an empty collection rather
   than warning falsely.
 
-## Open findings from the Nov 2026 review
+## The Nov 2026 review, and where its findings landed
 
-A full review of the branch turned up twelve issues. The three high-severity ones
-and the exposed probe command are fixed (see the invariants above and
-`probe_allowed_when`). These eight are **known and unfixed** — don't rediscover
-them, and don't assume they are deliberate:
+A full review of the branch turned up twelve issues. **All twelve are fixed**, each
+with a regression test. They are listed here because several were bugs of a kind
+that reads as correct code, and the tests are named after the mistake rather than
+the function:
 
-| Where | Issue |
+| Where | What it was |
 |---|---|
-| `commands.rs` `get_history` | CSV export and History totals are silently capped at **200 records**. `export_history_csv` passes `None`, which `get_history` turns into `take(200)`. A user with 500 rows exports 200 and is told "Exported 200 records". |
-| `drain.rs` `WrittenSummary::from_buy` | A **merged** buy is reported as "written as a separate asset", with `o.asset`'s id and the delta rather than the target id and merged total. `o.merged` is never consulted. The user is told the opposite of what happened. |
-| `commands.rs` + `History.svelte` + `ReviewCard.svelte` | **Item-name precedence is inverted.** `QueueItem::item_name` is `edits.item_name.or(resolved)` — the override is what gets written — but every display path does `resolved.or(edits.item_name)`. A corrected name is written to the database while the card, the History table, its search filter and the CSV all show the resolved one. |
-| `log/watcher.rs` ~320 | After a rotation the safe-offset floor is taken from the **old** file's position (`offset_before_batch`), and is persisted beside the new file's identity. A tick carrying both a rotation and a trade line can write a far-too-large offset, which the next launch then `Resume`s past. |
-| `backend/pocketbase.rs` `asset_from_pb` | An **empty** `app_id` is accepted (only absent is rejected), yielding an `AssetRecord` with `id: ""`. It can then be picked as a sell or merge target, after which every id-based call fails the uuid parse. |
-| `backend/pocketbase.rs` | A PocketBase `PATCH` **cannot delete fields**, so an orphan trade keeps stale `buyPrice`/`buyUnit`/`buyLocation`. The Firestore path handles this deliberately via `updateMask`; PocketBase needs explicit nulls. |
-| `commands.rs` `cold_start_for` | The first-run trade count scans with `hold_ms = 0`, and `scan` requires `d >= 0 && d <= hold_ms`, so a failed trade is never discarded and is counted as real. Contradicts `ColdStart::Backfill`'s own doc comment. |
-| `suggestions.svelte.ts` `recentLocations` | Not actually recency-ordered: it reverses `Object.values` (insertion order by `shopId`), and re-`remember`ing an existing shopId leaves its key in place. The place just used can fall outside `slice(0, 4)`. |
+| `queue.rs` `retry` | Retrying a failed **merged** buy could add the quantity twice. `restore` and `open` guarded `merge_applied`; `retry` did not. See the invariant above. |
+| `config.rs` `write_atomic` | A `remove_file` before the rename opened a window with no `queue.json` at all. See the invariant above. |
+| `commands.rs` `offset_for` | A backfill cold start reused a saved offset belonging to a different file. Extracted as a pure fn so all four arms are tested. |
+| `commands.rs` `get_history` | CSV export and History totals were capped at **200 records** — `export_history_csv` passes `None` and the default was 200. Now `usize::MAX`. |
+| `drain.rs` `WrittenSummary::from_buy` | A merged buy was reported as "written as a separate asset", with the new asset's id and the delta. It now branches on `o.merged` and reports the target id and merged total. Note `would_have_merged_into` is populated on **both** paths, so branching on it says the opposite of what happened. |
+| `commands.rs` + `History.svelte` + `ReviewCard.svelte` | **Item-name precedence was inverted.** `QueueItem::item_name` is `edits.item_name.or(resolved)` — the override is written — while every display path did `resolved.or(edits.item_name)`. Fixed at the source: `ItemView::effective_item_name` is set from the same `item_name()` the writer uses, and the views read that. The one remaining `resolvedItemName` use is the name input's *placeholder*, which is correct. |
+| `log/watcher.rs` | After a rotation the safe-offset floor was taken from the **old** file's position and persisted beside the new file's identity, so the next launch `Resume`d past it. Now `if out.rotated { 0 }`. |
+| `backend/pocketbase.rs` `asset_from_pb` | An **empty** `app_id` was accepted (only absent was rejected), yielding `id: ""` — pickable as a sell or merge target, after which every id-based call fails the uuid parse. |
+| `backend/pocketbase.rs` | A PocketBase `PATCH` cannot delete fields, so an orphan trade kept stale `buyPrice`/`buyUnit`/`buyLocation`. `trade_clearable()` writes explicit empties; it deliberately never touches `quality`/`uexBuyId`. |
+| `commands.rs` `cold_start_for` | The first-run trade count scanned with `hold_ms = 0`, and `scan` requires `d <= hold_ms`, so a failed trade was counted as real. It now takes the configured `grace_ms`. |
+| `suggestions.svelte.ts` | `recentLocations` was not recency-ordered — it reversed insertion order by `shopId`, so the place just used could fall outside `slice(0, 4)`. Now an explicit `order` list. |
+| `probe.rs` | The backend probe commands were reachable in a release build. `probe_allowed_when(cfg!(debug_assertions))` gates both, testably. |
 
 The review found nothing to fault in `parse.rs`, `ids.rs`, `units.rs`, `value.rs`,
 `tail.rs`'s offset/partial-line handling, the Firestore update-mask strategy, or
 the sell-ordering rules.
 
 Three of the twelve (the backfill offset, the rotation floor, the first-run
-count) are in the **cold-start/rotation path**, which is where the real bugs
+count) were in the **cold-start/rotation path**, which is where the real bugs
 clustered and is the least covered by tests. Treat changes there with suspicion.
 
 ## Log rotation

@@ -59,6 +59,35 @@ pub struct WrittenSummary {
 
 impl WrittenSummary {
     fn from_buy(o: &crate::writer::WriteOutcome) -> Self {
+        // A merged buy has to be reported as a merge: the document written is
+        // the *target*, not `o.asset`, and the resulting amount is the merged
+        // total rather than this buy's delta. `would_have_merged_into` is
+        // populated on both paths, so branching on it instead of on `merged`
+        // described the one non-repeatable operation in the design as the
+        // opposite of what it did.
+        if let Some(m) = &o.merged {
+            return Self {
+                id: m.target_id.clone(),
+                kind: TradeKind::Buy,
+                item: o.asset.item.clone(),
+                amount: m.new_amount,
+                unit: m.unit,
+                location: m.location.clone(),
+                detail: format!(
+                    "merged into {}: {} → {} {}{}",
+                    m.target_id,
+                    m.old_amount,
+                    m.new_amount,
+                    m.unit.as_str(),
+                    if m.also_matching.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {} other row(s) also match", m.also_matching.len())
+                    }
+                ),
+                over_sold_by: 0.0,
+            };
+        }
         Self {
             id: o.asset.id.clone(),
             kind: TradeKind::Buy,
@@ -247,5 +276,96 @@ fn humanise(e: &BackendError) -> String {
         }
         BackendError::NotConfigured(m) => format!("The backend is not configured: {m}"),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::AssetRecord;
+    use crate::writer::{MergePlan, WriteOutcome};
+
+    fn asset() -> AssetRecord {
+        AssetRecord {
+            id: "buy-own-id".into(),
+            item: "Ammonia".into(),
+            amount: 64.0,
+            unit: Some(CargoUnit::Scu),
+            buy_price: 782.32,
+            location: "Port Tressler".into(),
+            quality: None,
+            created_at: "2026-11-01T17:49:12.944Z".into(),
+            logged_by: Some("m1nd".into()),
+            source: Some("log-watcher".into()),
+            uex_buy_id: None,
+        }
+    }
+
+    fn plan() -> MergePlan {
+        MergePlan {
+            target_id: "older-asset".into(),
+            unit: CargoUnit::Scu,
+            old_amount: 100.0,
+            old_buy_price: 500.0,
+            added_amount: 64.0,
+            added_buy_price: 782.32,
+            new_amount: 164.0,
+            new_buy_price: 610.3,
+            location: "Port Tressler".into(),
+            also_matching: vec!["another".into()],
+        }
+    }
+
+    /// A merged buy must be reported as a merge. The document written is the
+    /// target, and the resulting amount is the merged total -- not this buy's
+    /// own id and delta. `would_have_merged_into` is populated on both paths,
+    /// so branching on it described the one non-repeatable operation in the
+    /// design as its opposite.
+    #[test]
+    fn a_merged_buy_is_reported_as_a_merge() {
+        let out = WriteOutcome {
+            asset: asset(),
+            merged: Some(plan()),
+            would_have_merged_into: vec!["older-asset".into(), "another".into()],
+        };
+        let s = WrittenSummary::from_buy(&out);
+
+        assert_eq!(s.id, "older-asset", "the document actually written");
+        assert_eq!(s.amount, 164.0, "the merged total, not the 64 delta");
+        assert!(s.detail.contains("merged into older-asset"), "{}", s.detail);
+        assert!(s.detail.contains("100"), "{}", s.detail);
+        assert!(s.detail.contains("164"), "{}", s.detail);
+        assert!(
+            !s.detail.contains("separate asset"),
+            "must not claim the opposite: {}",
+            s.detail
+        );
+    }
+
+    /// The opt-out path still reports a separate row, and says matches existed.
+    #[test]
+    fn an_opted_out_buy_is_reported_as_a_separate_row() {
+        let out = WriteOutcome {
+            asset: asset(),
+            merged: None,
+            would_have_merged_into: vec!["older-asset".into()],
+        };
+        let s = WrittenSummary::from_buy(&out);
+
+        assert_eq!(s.id, "buy-own-id");
+        assert_eq!(s.amount, 64.0);
+        assert!(s.detail.contains("separate asset"), "{}", s.detail);
+        assert!(s.detail.contains("1 existing"), "{}", s.detail);
+    }
+
+    /// And a plain first buy says so plainly.
+    #[test]
+    fn a_first_buy_is_reported_as_a_new_asset() {
+        let out = WriteOutcome {
+            asset: asset(),
+            merged: None,
+            would_have_merged_into: Vec::new(),
+        };
+        assert_eq!(WrittenSummary::from_buy(&out).detail, "new asset");
     }
 }

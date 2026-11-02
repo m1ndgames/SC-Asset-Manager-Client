@@ -20,12 +20,27 @@
 
 const byShop = $state<Record<string, string>>({});
 
+/**
+ * Locations in the order they were last used, most recent last.
+ *
+ * Kept separately because `byShop` cannot express recency: its key order is
+ * first-insertion order by `shopId`, and re-recording an existing shopId
+ * leaves that key where it was.
+ */
+const order = $state<string[]>([]);
+
 /** Record what the user chose, so sibling kiosks can offer it. */
 export function remember(shopId: string | null | undefined, location: string) {
   const id = shopId?.trim();
   const loc = location.trim();
   if (!id || !loc) return;
   byShop[id] = loc;
+
+  // Move to the end rather than appending blindly, so using a place again
+  // makes it the most recent instead of leaving it where it first appeared.
+  const at = order.indexOf(loc);
+  if (at !== -1) order.splice(at, 1);
+  order.push(loc);
 }
 
 /** What this kiosk was called last time, this session. */
@@ -42,9 +57,5 @@ export function suggestionFor(shopId: string | null | undefined): string | null 
  * `locations.json`.
  */
 export function recentLocations(): string[] {
-  const seen: string[] = [];
-  for (const loc of Object.values(byShop)) {
-    if (!seen.includes(loc)) seen.push(loc);
-  }
-  return seen.reverse();
+  return order.slice().reverse();
 }

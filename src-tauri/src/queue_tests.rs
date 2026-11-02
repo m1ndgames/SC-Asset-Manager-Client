@@ -872,3 +872,47 @@ fn a_failed_plain_write_is_still_retryable() {
     assert_eq!(q.get(&id).unwrap().state, ItemState::Approved);
     assert!(q.get(&id).unwrap().error.is_none());
 }
+
+/// `ItemView::effective_item_name` must be the name that gets *written*, i.e.
+/// a user override beats the resolved name. Every display path reads this; they
+/// used to read `resolved_item_name.or(edits)`, the reverse of what
+/// `QueueItem::item_name` feeds the writer, so a corrected name was written to
+/// the database while the card, the History table and the CSV all showed the
+/// resolved one.
+#[test]
+fn the_view_shows_the_name_that_will_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let rd = refdata();
+    let mut q = Queue::open(dir.path());
+    let id = q.enqueue(detected(BUY)).unwrap().id.clone();
+
+    let v = crate::queue::view(q.get(&id).unwrap(), &rd);
+    assert_eq!(
+        v.effective_item_name.as_deref(),
+        v.resolved_item_name.as_deref(),
+        "with no override the two agree"
+    );
+    assert!(v.effective_item_name.is_some(), "the fixture GUID resolves");
+
+    q.update(
+        &id,
+        ItemPatch {
+            item_name: Some(Some("Corrected Name".into())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let item = q.get(&id).unwrap();
+    let v = crate::queue::view(item, &rd);
+    assert_eq!(v.effective_item_name.as_deref(), Some("Corrected Name"));
+    assert_eq!(
+        v.effective_item_name.as_deref(),
+        item.item_name(&rd),
+        "the view and the writer must never disagree about the name"
+    );
+    assert_ne!(
+        v.effective_item_name, v.resolved_item_name,
+        "and the resolved name is still available for the input placeholder"
+    );
+}

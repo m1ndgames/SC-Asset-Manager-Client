@@ -23,9 +23,10 @@ pub struct WriteOutcome {
     /// Set when this buy was folded into an existing asset instead of being
     /// written as its own row.
     pub merged: Option<MergePlan>,
-    /// Assets that already existed with this item and location. Non-empty means
-    /// the app's merge rule *would* have merged; Phase 3 writes a separate row
-    /// and says so rather than deciding for the user.
+    /// Assets that already existed with this item and location. Populated on
+    /// both paths, so it does **not** indicate that no merge happened — check
+    /// `merged` for that. On the opt-out path it is what lets the UI say a
+    /// separate row was written while matches existed.
     pub would_have_merged_into: Vec<String>,
 }
 

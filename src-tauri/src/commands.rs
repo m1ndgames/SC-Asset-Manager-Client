@@ -154,7 +154,7 @@ fn watch_path(cfg: &config::Config) -> AppResult<PathBuf> {
 pub fn plan_watch_start(state: State<'_, AppState>) -> AppResult<ColdStart> {
     let cfg = state.config();
     let path = watch_path(&cfg)?;
-    Ok(cold_start_for(&path))
+    Ok(cold_start_for(&path, cfg.grace_window_ms))
 }
 
 /// Start watching.
@@ -186,7 +186,7 @@ pub fn start_watcher(
 
     let offset = match offset {
         Some(o) => o,
-        None => offset_for(cold_start_for(&path)),
+        None => offset_for(cold_start_for(&path, cfg.grace_window_ms)),
     };
 
     let handle = watcher_task::start(app, &cfg, path, offset)?;
@@ -217,10 +217,16 @@ fn offset_for(plan: ColdStart) -> u64 {
 
 /// The cold-start decision, with the trade count filled in only when a first
 /// run makes one necessary.
-fn cold_start_for(path: &std::path::Path) -> ColdStart {
+fn cold_start_for(path: &std::path::Path, grace_ms: i64) -> ColdStart {
     let st = watchstate::load();
     watcher::plan_cold_start(path, &st, |p| match std::fs::read(p) {
-        Ok(bytes) => scan::scan(&String::from_utf8_lossy(&bytes), 0).trades.len(),
+        // The real grace window, not 0. `scan` matches an error to its request
+        // with `d >= 0 && d <= hold_ms`, so 0 only ever matches an error in the
+        // same millisecond -- meaning a failed trade is counted as a real one
+        // and the first-run prompt overstates what the log contains.
+        Ok(bytes) => scan::scan(&String::from_utf8_lossy(&bytes), grace_ms)
+            .trades
+            .len(),
         Err(_) => 0,
     })
 }
@@ -265,9 +271,13 @@ pub fn get_history(state: State<'_, AppState>, limit: Option<usize>) -> Vec<Item
     // Newest first: history is read to check what just happened.
     let mut items: Vec<&crate::queue::QueueItem> = q.history().iter().collect();
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    // `None` means all of it. It used to mean 200, which silently truncated
+    // the CSV export and the History totals -- and reported the truncated
+    // count as if it were the whole thing. PLAN.md §2 sizes this at hundreds
+    // of records, so there is nothing to page.
     items
         .into_iter()
-        .take(limit.unwrap_or(200))
+        .take(limit.unwrap_or(usize::MAX))
         .map(|i| queue::view(i, &rd))
         .collect()
 }
@@ -588,10 +598,10 @@ pub fn history_csv(items: &[crate::queue::ItemView]) -> String {
             i.item.detected.line.kind.as_str().to_string(),
             i.item.updated_at.clone(),
             i.item.detected.line.log_timestamp.clone(),
-            i.resolved_item_name
-                .clone()
-                .or_else(|| i.item.edits.item_name.clone())
-                .unwrap_or_default(),
+            // The effective name, i.e. what was written. Using the resolved
+            // name here would make the export disagree with the database
+            // whenever the user corrected one.
+            i.effective_item_name.clone().unwrap_or_default(),
             i.item.detected.line.resource_guid.clone(),
             // Full precision: a price rounded for a spreadsheet is a price
             // that no longer reconciles against the database.

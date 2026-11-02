@@ -654,6 +654,11 @@ pub struct ItemView {
     pub item: QueueItem,
     /// Resolved name, or `None` when the GUID is unknown and the user must say.
     pub resolved_item_name: Option<String>,
+    /// The name that will actually be written — [`QueueItem::item_name`], so a
+    /// user override wins over the resolved name. Display this, not
+    /// `resolved_item_name`: showing the resolved name while writing the
+    /// override makes the CSV stop reconciling against the database.
+    pub effective_item_name: Option<String>,
     /// What will actually be written, after edits.
     pub effective_amount_scu: f64,
     pub effective_unit_price_per_scu: f64,
@@ -675,6 +680,7 @@ pub fn view(item: &QueueItem, refdata: &RefData) -> ItemView {
         resolved_item_name: refdata
             .name_of(&item.detected.line.resource_guid)
             .map(str::to_string),
+        effective_item_name: item.item_name(refdata).map(str::to_string),
         effective_amount_scu: amount,
         effective_unit_price_per_scu: price,
         display_amount: units::convert(amount, CargoUnit::Scu, unit),

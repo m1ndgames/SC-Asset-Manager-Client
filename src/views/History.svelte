@@ -91,7 +91,7 @@
       .filter((i) => {
         const q = query.trim().toLowerCase();
         if (!q) return true;
-        const name = (i.resolvedItemName ?? i.edits.itemName ?? "").toLowerCase();
+        const name = (i.effectiveItemName ?? "").toLowerCase();
         return (
           name.includes(q) ||
           (i.edits.location ?? "").toLowerCase().includes(q) ||
@@ -258,7 +258,7 @@
                   </span>
                 </td>
                 <td class="px-2 py-1 text-text">
-                  {i.resolvedItemName ?? i.edits.itemName ?? "—"}
+                  {i.effectiveItemName ?? "—"}
                 </td>
                 <td class="px-2 py-1 whitespace-nowrap text-text">
                   {qty(i.effectiveAmountScu)}
