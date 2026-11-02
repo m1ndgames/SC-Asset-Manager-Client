@@ -37,7 +37,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
@@ -98,7 +98,13 @@ jobs:
           releaseDraft: true
           prerelease: false
           # Writes latest.json, which is what tauri-plugin-updater reads.
-          includeUpdaterJson: true
+          #
+          # tauri-action v1 renamed this from `includeUpdaterJson`. Actions
+          # ignores an input a workflow passes but the action does not declare,
+          # silently, so the old name would have sat here reading as though it
+          # controlled something. It happens to default to true, so nothing
+          # broke -- but the next such rename may not be so forgiving.
+          uploadUpdaterJson: true
 
       # Published unsigned, so the hashes are the only way for someone to
       # check that what they downloaded is what was built.
