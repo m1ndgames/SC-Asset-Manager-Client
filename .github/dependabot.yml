@@ -54,10 +54,16 @@ updates:
       tauri-js:
         patterns:
           - "@tauri-apps/*"
+      # vite belongs here, not on its own. @sveltejs/vite-plugin-svelte pins an
+      # exact vite major in its peer range, so a lone bump of either one is
+      # unresolvable: vite 8 alone conflicts with plugin-svelte 6, and
+      # plugin-svelte 7 alone conflicts with vite 7. Dependabot opened both as
+      # separate PRs and neither could ever pass.
       svelte:
         patterns:
           - svelte
           - svelte-check
+          - vite
           - "@sveltejs/*"
       tailwind:
         patterns:
@@ -70,6 +76,7 @@ updates:
           - "@tauri-apps/*"
           - svelte
           - svelte-check
+          - vite
           - "@sveltejs/*"
           - tailwindcss
           - "@tailwindcss/*"

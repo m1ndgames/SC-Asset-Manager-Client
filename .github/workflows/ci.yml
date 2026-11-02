@@ -36,6 +36,16 @@ jobs:
       - name: svelte-check
         run: npm run check
 
+      # svelte-check type-checks; it does not bundle. A dependency that breaks
+      # bundling passes it cleanly -- vite 8 + @tailwindcss/vite 4.3.3 reports
+      # 0 errors over 264 files and then fails `vite build`, because vite 8
+      # dropped its bundled esbuild and @tailwindcss/node still calls
+      # `transformWithEsbuild`. Nothing else in CI builds the frontend: the
+      # release workflow does, via tauri-action, which is far too late to find
+      # out.
+      - name: frontend build
+        run: npm run build
+
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
         working-directory: src-tauri
