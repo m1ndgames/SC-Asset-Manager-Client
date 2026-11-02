@@ -29,7 +29,7 @@ certificate is the only real fix for that, and it is a recurring cost, so for
 now the honest answer is to verify the download yourself:
 
 ```powershell
-Get-FileHash ".\SC.Asset.Manager.Client_0.1.0_x64_en-US.msi" -Algorithm SHA256
+Get-FileHash ".\SC.Asset.Manager.Client_0.1.1_x64_en-US.msi" -Algorithm SHA256
 ```
 
 and compare it against `SHA256SUMS.txt`, published as an asset on the same
@@ -131,9 +131,10 @@ is deliberate: the alternative is a build that exits 0 having silently produced 
 updater artifacts. Set the variables, or accept the non-zero exit when you only
 want the installers.
 
-Bump the version in **both** `src-tauri/tauri.conf.json` and
-`src-tauri/Cargo.toml` — there is a test asserting they agree, and the workflow
-refuses a tag that does not match.
+The version lives in **three** files — `src-tauri/tauri.conf.json`,
+`src-tauri/Cargo.toml` and `package.json`. Bump all three;
+`the_crate_version_matches_the_bundle_version` asserts they agree, and the
+workflow refuses a tag that does not match `tauri.conf.json`.
 
 See [PLAN.md](PLAN.md) for the implementation plan and
 [CLAUDE.md](CLAUDE.md) for the invariants that are easy to break silently.
