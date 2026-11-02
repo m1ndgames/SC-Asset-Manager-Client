@@ -1,6 +1,6 @@
 [package]
 name = "sc-asset-manager-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Trade parsing from Game.log, with review, for SC-Asset-Manager"
 authors = ["m1nd"]
 edition = "2021"

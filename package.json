@@ -1,7 +1,7 @@
 {
   "name": "sc-asset-manager-client",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Trade parsing from Game.log, with review, for SC-Asset-Manager",
   "scripts": {

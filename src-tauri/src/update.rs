@@ -159,6 +159,17 @@ mod tests {
             env!("CARGO_PKG_VERSION"),
             "tauri.conf.json and Cargo.toml disagree about the version"
         );
+
+        // package.json carries it too, and nothing read it -- so it was in
+        // sync by luck. A stale third copy is the kind of thing that gets
+        // believed in a bug report.
+        let pkg: serde_json::Value =
+            serde_json::from_str(include_str!("../../package.json")).unwrap();
+        assert_eq!(
+            pkg["version"].as_str().unwrap(),
+            env!("CARGO_PKG_VERSION"),
+            "package.json disagrees about the version"
+        );
     }
 
     /// `requireSignedVersion` must stay on: it is the only guard against a
