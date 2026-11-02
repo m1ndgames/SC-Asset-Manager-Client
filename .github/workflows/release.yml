@@ -121,7 +121,13 @@ jobs:
           $lines = foreach ($p in $paths) {
             if (Test-Path $p) {
               $h = (Get-FileHash -Algorithm SHA256 -Path $p).Hash.ToLower()
-              "$h  $([System.IO.Path]::GetFileName($p))"
+              # GitHub replaces spaces with dots in a release asset's name, and
+              # the product name has three of them. Listing the local filename
+              # here produces correct hashes under names that do not exist on
+              # the release, so the one instruction the README gives -- look
+              # your download up in this file -- finds nothing.
+              $name = [System.IO.Path]::GetFileName($p) -replace ' ', '.'
+              "$h  $name"
             }
           }
           if (-not $lines) { throw "no artifacts to checksum" }

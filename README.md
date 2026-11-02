@@ -29,12 +29,16 @@ certificate is the only real fix for that, and it is a recurring cost, so for
 now the honest answer is to verify the download yourself:
 
 ```powershell
-Get-FileHash ".\SC Asset Manager Client_0.1.0_x64_en-US.msi" -Algorithm SHA256
+Get-FileHash ".\SC.Asset.Manager.Client_0.1.0_x64_en-US.msi" -Algorithm SHA256
 ```
 
 and compare it against `SHA256SUMS.txt`, published as an asset on the same
 release. Checksums are attached before the release is made public, so they are
 always there.
+
+(The dots in the filename are GitHub's doing — it replaces the spaces in the
+product name when it serves an asset. `SHA256SUMS.txt` lists the names as
+served, so what you downloaded is what you look up.)
 
 To get past the warning: **More info** → **Run anyway**.
 
