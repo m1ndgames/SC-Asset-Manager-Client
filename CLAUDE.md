@@ -314,16 +314,42 @@ is in the loop, so don't re-litigate it without new data:
   container*. Never render it as a location — it is labelled "container" in the UI for
   this reason. (The committed fixtures cannot show this: they are slices of
   commodity-class lines with no vehicle lines in them.)
-- **`shopId` and `kioskId` are per-session entity ids.** 24 distinct `shopId`s across 11
-  sessions; exactly one appears in two. So "remember the location for this kiosk" is
-  valid *within* a session only, which is why `suggestions.svelte.ts` is module state
-  and never touches disk.
+- **`shopId` and `kioskId` are runtime GEIDs, not references into the game files.**
+  Settled against the corpus, so this is not worth re-investigating: `kioskId` is
+  `shopId` plus a small per-shop constant (+1, +4, -8, +2, -36, -60), i.e. the next
+  allocation from one counter at spawn; the values track wall-clock time across builds
+  (8.517e12 Dec 2025 → 9.956e12 Apr 2026, then 8.6e11 after a server-side scheme
+  change); and build `12913470` spans four sessions at the same stations with disjoint
+  ranges (`906819…` vs `863042…`). `playerId` sits in the same number space and is
+  unambiguously runtime-assigned. Nothing static can be looked up from them, which is
+  why no amount of unpacking helps — and a raw string search of `Data.p4k` settles
+  nothing either way, since the archive is compressed.
+- **The id lives for the shard's lifetime, not the session's.** `906792501776` appears
+  in `session-12913470-261031.log` (16:25) *and* `session-12913470-261031-2.log`
+  (16:49), then is gone 1h40 later: under Persistent Entity Streaming the station entity
+  stays spawned, so a relog inside the shard's life sees the same id. This is the
+  "exactly one appears in two sessions" observation, explained. `suggestions.svelte.ts`
+  still must not persist the mapping — it would be right while the shard lives and
+  silently wrong once a GEID is recycled, with nothing on the line to tell you which.
 - **`shopName` is usually a generic template** (`SCShop_Admin_lt_base_g`). Some do
   self-identify — `SCShop_AdminOffice_GrimHex`, `SCShop_ht_delta_shubin_m_store`,
   `TDD_SCShop-001` — but admin offices everywhere share the one name.
-- Unexplored lead: the kiosk entity carries `m_svLinkedLocationManagerId`. If one of
-  those covers every kiosk at a station it would be a better within-session key than
-  `shopId`. Needs a session with two kiosks at one station to test.
+- **`m_svLinkedLocationManagerId` is a closed lead, not an open one.** It would be a
+  better within-shard key than `shopId`, but it is a GEID in the same number space and
+  so resolves to a name no better than `shopId` does.
+- **`shopName` → station is feasible and was rejected on its coverage.** The link does
+  exist in the p4k: `Data\Libs\CosmoTools\LayerRecovery\LayerBackups.xml` holds one
+  `ShopBackup` per shop (1,184 on Stanton) carrying `ID`, `SuperName` and `ShopName`,
+  and [P4KX](https://github.com/p4kx-org/p4kx) already resolves each to a starmap entry
+  by name (63 of 77 containers match). No `.soc` parsing needed. Measured against the
+  corpus it is still not worth building: of 94 shop-bearing lines it would resolve to a
+  *single* location for **one** (`SCShop_AdminOffice_GrimHex`). `SCShop_Admin_lt_base_g`
+  is 32 of those lines and narrows to nothing; the rest narrow to a short list, which
+  `recentLocations()` already gives from real session history. It would also fail
+  *plausible* rather than absent — when CIG moves a shop the mapping names the old
+  station confidently — and it carries a per-patch regeneration obligation. The numbers
+  are here so the next person reaching for this finds the measurement instead of redoing
+  it.
 
 ## What the log does *not* tell you about money
 

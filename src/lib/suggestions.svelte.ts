@@ -4,10 +4,19 @@
  * **Within this session only, and never auto-filled.** Two reasons, one
  * measured and one a design rule:
  *
- * - `shopId` is a per-session entity id. Measured across 11 real sessions: 24
- *   distinct shopIds, exactly one of which ever appears in two sessions. So a
- *   remembered mapping is worthless after a relaunch and persisting it would
- *   only lend it false authority.
+ * - `shopId` is a runtime entity id (a GEID), minted by the server when the
+ *   entity spawns. `kioskId` is the next ticket from the same counter: across
+ *   the corpus it is `shopId` plus a small per-shop constant (+1, +4, -8, +2,
+ *   -36, -60). The values track wall-clock time across builds — 8.517e12 in
+ *   Dec 2025 rising monotonically to 9.956e12 in Apr 2026, then 8.6e11 after a
+ *   server-side scheme change — so they identify an allocation, not a place.
+ *
+ *   The id lives for the *shard's* lifetime, not the session's. 906792501776
+ *   appears in two sessions 24 minutes apart and is gone 1h40 later, because
+ *   the station entity stays spawned under Persistent Entity Streaming. That
+ *   is why this must not reach disk: a persisted mapping is right while the
+ *   shard lives and silently wrong once the GEID is recycled onto a different
+ *   entity, and nothing on the line distinguishes the two cases.
  * - A wrong auto-filled location is worse than an empty one. The log genuinely
  *   does not record where you were — nothing in it names the station, verified
  *   on a full log — so a guess the user doesn't notice becomes a wrong record
