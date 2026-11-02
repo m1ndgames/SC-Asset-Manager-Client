@@ -74,8 +74,16 @@ and passes (277 tests green, clippy clean under `-D warnings`):
   missing — `Failed` is **not** terminal, so a failed write stays in the queue
   and `retry_item` already handles it from the Review view.
 
-**Not built yet:** nothing in the feature plan. No release has been cut, so
-neither workflow has ever run.
+**Not built yet:** nothing in the feature plan.
+
+**Released and verified.** 0.1.0 and 0.1.1 are published. Both workflows have
+run, and the whole chain is exercised rather than assumed — build, sign,
+checksum, draft, publish, manifest, download, and **an update installed on a
+real machine**. 0.1.1 contains no application code at all (`git diff
+v0.1.0..HEAD -- src src-tauri/src` was empty); it exists because an update
+whose payload cannot regress is the cheapest way to test the updater, and that
+test passed. See "What shipping the first release taught us" below for the four
+things that were wrong and invisible.
 
 `PLAN.md` is the design of record and settles most questions about structure, crate
 choices and deliberate omissions. Read the relevant section before proposing an
@@ -593,6 +601,80 @@ the sell-ordering rules.
 Three of the twelve (the backfill offset, the rotation floor, the first-run
 count) were in the **cold-start/rotation path**, which is where the real bugs
 clustered and is the least covered by tests. Treat changes there with suspicion.
+
+## What shipping the first release taught us
+
+Four problems that every local test passed. All fixed; listed because each is
+the kind that looks like working code.
+
+- **`SHA256SUMS.txt` named files that did not exist.** GitHub replaces spaces
+  in a release asset's name with dots, and the product name has three. The
+  workflow listed local build paths, so four correct hashes sat under four
+  filenames nobody could download — the one verification step the README asks
+  for could not be completed. The hashes were never wrong, which is why nothing
+  flagged it. Caught by downloading the published MSI and hashing it. The
+  workflow now does `-replace ' ', '.'`.
+
+- **CI type-checked but never bundled.** `svelte-check` reports **0 errors over
+  264 files** on a tree whose `vite build` fails outright. Measured, not
+  supposed: vite 8 with `@tailwindcss/vite` 4.3.3 passes the check and then dies
+  because vite 8 dropped its bundled esbuild while `@tailwindcss/node` still
+  calls `transformWithEsbuild`. The only other place the frontend got built was
+  the release workflow, via `tauri-action`, i.e. after the tag. CI now runs
+  `npm run build`, and the first thing it caught was the Dependabot PR for that
+  exact bump.
+
+- **`tauri-action` v1 renamed `includeUpdaterJson` to `uploadUpdaterJson`**, and
+  **Actions silently ignores an input the action does not declare**. The old
+  name sat in `release.yml` reading as though it controlled whether
+  `latest.json` ships. It happened to be harmless — checked against v1's own
+  `action.yml`, the new name defaults to `true` — but that was luck. When
+  bumping this action, diff its declared inputs; a green CI run says nothing,
+  because `ci.yml` does not use `tauri-action` at all.
+
+- **v1 also changed `latest.json` to GitHub *API* asset URLs**
+  (`api.github.com/.../releases/assets/<id>`) instead of browser download URLs.
+  A plain GET to one of those returns ~1.9 KB of **JSON metadata, not the
+  installer**. It works only because `tauri-plugin-updater` inserts
+  `Accept: application/octet-stream` before downloading
+  (`updater.rs:838` in 2.14.1) — verified by fetching the URL with that header
+  and matching the result's SHA-256 against the published MSI. **This is a
+  coupling to remember:** a plugin version that stopped sending that header
+  would download JSON, fail signature verification, and break updates in a way
+  only a real update attempt reveals.
+
+### Verified on the wire, not inferred
+
+- **The signature's trusted comment carries the version**, which is the sole
+  thing `requireSignedVersion` rests on. Decoded from the published v0.1.0
+  `.sig`:
+  `trusted comment: timestamp:... file:... version:0.1.0`. So `tauri build`
+  does pass `--app-version` automatically, as the section above claims from
+  reading the CLI source.
+- **The updater works end to end.** 0.1.0 → 0.1.1 downloaded, verified against
+  the baked-in public key and installed on a real machine.
+
+### Dependency majors currently blocked
+
+Neither is a preference; both are upstream and both are closed with the reason
+on the PR.
+
+| Bump | Blocker |
+|---|---|
+| TypeScript 7 | `svelte-check` 4.7.8, the newest, still peers `typescript@^5 \|\| ^6`. `npm run check` is a CI gate. |
+| vite 8 | `@tailwindcss/node` still calls `transformWithEsbuild`. Resolvable only by adding `esbuild` as a direct dependency — a package with a postinstall script, taken on to work around someone else's migration. vite 7 bundles this frontend in ~2.3s. Revisit when Tailwind moves to `transformWithOxc`. |
+
+`@sveltejs/vite-plugin-svelte` pins an exact vite major in its peer range, so
+**vite and the svelte plugin must move together** — bumping either alone is
+unresolvable and Dependabot opened two PRs that could never pass. `vite` is now
+in the `svelte` group in `dependabot.yml` for that reason.
+
+### The version lives in three files
+
+`src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `package.json`. Only the
+first two were asserted to agree, so `package.json` was in sync by luck;
+`the_crate_version_matches_the_bundle_version` now covers all three. The release
+workflow also refuses a tag that disagrees with `tauri.conf.json`.
 
 ## Log rotation
 
